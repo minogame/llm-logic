@@ -112,23 +112,55 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
+from data_generator_bool import BoolLogic as Dataset, BoolLogicTokenizer as Tokenizer
+tokenizer = Tokenizer()
+data_train = Dataset.load_dataset(filename='bool_logic_dataset.pkl')
+data_val = Dataset.load_dataset(filename='bool_logic_dataset.pkl')
+data_train['offset'] = 0
+data_val['offset'] = 0
+
 data_dir = os.path.join('data', dataset)
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+
     if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+        data = data_train
+    elif split == 'val':
+        data = data_val
+
+    x_to_stack = []
+    y_to_stack = []
+    loss_mask_to_stack = []
+    for idx in range(batch_size):
+        expression_idx = data['offset'] + idx
+        tokenized_expression = data['tokenized_expressions'][expression_idx]
+        if len(tokenized_expression) > block_size:
+            # truncate the expression to fit into the block size
+            tokenized_expression = tokenized_expression[-block_size:]
+            target_expression = tokenized_expression[1:] + [tokenizer.tokens[' ']]  # shift by one for target
+        else:
+            # pad the expression to fit into the block size
+            tokenized_expression += [tokenizer.tokens[' ']] * (block_size - len(tokenized_expression))
+            target_expression = tokenized_expression[1:] + [tokenizer.tokens[' ']]  # shift by one for target
+
+        loss_mask = [0] * data['pos_implies'][expression_idx] + \
+                    [1] * (len(data['tokenized_expressions'][expression_idx]) - data['pos_implies'][expression_idx]) + \
+                    [0] * (block_size - len(data['tokenized_expressions'][expression_idx]) - 1)
+        loss_mask_to_stack.append(torch.tensor(loss_mask, dtype=torch.float32))
+        x_to_stack.append(torch.from_numpy(np.array(tokenized_expression, dtype=np.int64)))
+        y_to_stack.append(torch.from_numpy(np.array(target_expression, dtype=np.int64)))
+
+        x = torch.stack(x_to_stack)
+        y = torch.stack(y_to_stack)
+        loss_mask = torch.stack(loss_mask_to_stack)
+        x, y, loss_mask = x.to(device), y.to(device), loss_mask.to(device)
+
+    data['offset'] += batch_size
+    if data['offset'] + batch_size > len(data):
+        # reset the offset to 0, so we can loop over the dataset
+        data['offset'] = 0
+        print(f"Resetting {split} dataset offset to 0")
+
+    return x, y, loss_mask
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0

@@ -4,8 +4,8 @@ import pickle
 class BoolLogicTokenizer:
     def __init__(self):
         self.tokens = {
-            ' ': 0,
-            'E': 1,
+            ' ': 0,  # padding token
+            'E': 1,  # end of expression
             'T': 2,
             'F': 3,
             '¬': 4,
@@ -14,7 +14,12 @@ class BoolLogicTokenizer:
             '→': 7,
             '↔': 8,
             '(': 9,
-            ')': 10
+            ')': 10,
+            '0': 11,  # Placeholder thinking tokens
+            '1': 12,
+            '2': 13,
+            '3': 14,
+            '4': 15,
         }
         self.reverse_tokens = {v: k for k, v in self.tokens.items()}
 
@@ -104,10 +109,28 @@ class BoolLogic:
         expressions = BoolLogic.generate_expressions(num_samples, depth, verbose)
         tokenized_expressions = []
         tokenizer = BoolLogicTokenizer()
+        pos_implies = []
+
         for e in expressions:
-            tokenized_expressions.append(tokenizer.tokenize(e))
+            tokenized_experssion = tokenizer.tokenize(e)
+            tokenized_experssion.append(tokenizer.tokens['E'])  # Append end token
+
+            first_implies = tokenized_experssion.index(tokenizer.tokens[BoolLogic.IMPLIES])
+            pos_implies.append(first_implies)
+
+        dataset = dict()
+        dataset['expressions'] = expressions
+        dataset['tokenized_expressions'] = tokenized_expressions
+        dataset['pos_implies'] = pos_implies
+
         with open(filename, 'wb') as f:
             pickle.dump(tokenized_expressions, f)
+
+    @staticmethod
+    def load_dataset(filename='bool_logic_dataset.pkl'):
+        with open(filename, 'rb') as f:
+            tokenized_expressions = pickle.load(f)
+        return tokenized_expressions
 
 if __name__ == "__main__":
     # Example usage
