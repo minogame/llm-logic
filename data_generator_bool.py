@@ -22,6 +22,7 @@ class BoolLogicTokenizer:
             '4': 15,
         }
         self.reverse_tokens = {v: k for k, v in self.tokens.items()}
+        self.vocab_size = len(self.tokens)
 
     def tokenize(self, expression):
         return [self.tokens[char] for char in expression if char in self.tokens]
@@ -115,6 +116,8 @@ class BoolLogic:
             tokenized_experssion = tokenizer.tokenize(e)
             tokenized_experssion.append(tokenizer.tokens['E'])  # Append end token
 
+            tokenized_expressions.append(tokenized_experssion)
+
             first_implies = tokenized_experssion.index(tokenizer.tokens[BoolLogic.IMPLIES])
             pos_implies.append(first_implies)
 
@@ -124,7 +127,7 @@ class BoolLogic:
         dataset['pos_implies'] = pos_implies
 
         with open(filename, 'wb') as f:
-            pickle.dump(tokenized_expressions, f)
+            pickle.dump(dataset, f)
 
     @staticmethod
     def load_dataset(filename='bool_logic_dataset.pkl'):
@@ -133,9 +136,12 @@ class BoolLogic:
         return tokenized_expressions
 
 if __name__ == "__main__":
-    # Example usage
-    expressions = BoolLogic.generate_expressions(num_samples=1000, depth=5, verbose=1)
-    print(max(len(expr) for expr in expressions))
-    for expr in expressions:
-        print(expr)
+    # # Example usage
+    # expressions = BoolLogic.generate_expressions(num_samples=1000, depth=5, verbose=1)
+    # print(max(len(expr) for expr in expressions))
+    # for expr in expressions:
+    #     print(expr)
 
+    BoolLogic.generate_dataset_and_save(num_samples=1000000, depth=3, verbose=1, filename='bool_logic_dataset_train.pkl')
+    BoolLogic.generate_dataset_and_save(num_samples=10000, depth=3, verbose=1, filename='bool_logic_dataset_val.pkl')
+    dataset = BoolLogic.load_dataset(filename='bool_logic_dataset_train.pkl')
