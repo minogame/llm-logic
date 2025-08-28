@@ -1,5 +1,6 @@
 import random
 import pickle
+import itertools
 
 class BoolLogicTokenizer:
     def __init__(self):
@@ -99,19 +100,68 @@ class BoolLogic:
     @staticmethod
     def generate_expressions(num_samples=10, depth=3, verbose=1):
 
-        expressions = set()
-        while len(expressions) < num_samples:
-            expressions.add(BoolLogic.generate_expression(depth, verbose))
+        # expressions = set()
+        # while len(expressions) < num_samples:
+        #     expressions.add(BoolLogic.generate_expression(depth, verbose))
 
-        return list(expressions)
+        # return list(expressions)
+
+        expressions = []
+        while len(expressions) < num_samples:
+            expr = BoolLogic.generate_expression(depth, verbose)
+            expressions.append(expr)
+
+        return expressions
     
     @staticmethod
     def generate_dataset_and_save(num_samples=1000000, depth=5, verbose=1, filename='bool_logic_dataset.pkl'):
+        print(f"Generating {num_samples} expressions with depth {depth} and verbosity {verbose}...")
         expressions = BoolLogic.generate_expressions(num_samples, depth, verbose)
         tokenized_expressions = []
         tokenizer = BoolLogicTokenizer()
         pos_implies = []
 
+        print(f"Tokenizing expressions...")
+        for e in expressions:
+            tokenized_experssion = tokenizer.tokenize(e)
+            tokenized_experssion.append(tokenizer.tokens['E'])  # Append end token
+
+            tokenized_expressions.append(tokenized_experssion)
+
+            first_implies = tokenized_experssion.index(tokenizer.tokens[BoolLogic.IMPLIES])
+            pos_implies.append(first_implies)
+
+        dataset = dict()
+        dataset['expressions'] = expressions
+        dataset['tokenized_expressions'] = tokenized_expressions
+        dataset['pos_implies'] = pos_implies
+
+        with open(filename, 'wb') as f:
+            pickle.dump(dataset, f)
+
+    @staticmethod
+    def generate_mixed_dataset_and_save(num_samples=1000000, depth=[1,2,3,4,5,6], verbose=1, filename='bool_logic_dataset.pkl'):
+        
+        tokenizer = BoolLogicTokenizer()
+        tokenized_expressions = []
+        pos_implies = []
+
+        expressions = []
+        for d, v in itertools.product(depth, verbose):
+
+            print(f"Generating {num_samples} expressions with depth {d} and verbosity {v}...")
+            if d == 1:
+                expressions.extend(BoolLogic.generate_expressions(16, d, v))
+            elif d == 2:
+                expressions.extend(BoolLogic.generate_expressions(256, d, v))
+            elif d == 3:
+                expressions.extend(BoolLogic.generate_expressions(num_samples, d, v))
+            else:
+                expressions.extend(BoolLogic.generate_expressions(num_samples, d, v))
+
+        random.shuffle(expressions)
+
+        print(f"Tokenizing expressions...")
         for e in expressions:
             tokenized_experssion = tokenizer.tokenize(e)
             tokenized_experssion.append(tokenizer.tokens['E'])  # Append end token
@@ -142,6 +192,11 @@ if __name__ == "__main__":
     # for expr in expressions:
     #     print(expr)
 
-    BoolLogic.generate_dataset_and_save(num_samples=1000000, depth=3, verbose=1, filename='bool_logic_dataset_train.pkl')
-    BoolLogic.generate_dataset_and_save(num_samples=10000, depth=3, verbose=1, filename='bool_logic_dataset_val.pkl')
-    dataset = BoolLogic.load_dataset(filename='bool_logic_dataset_train.pkl')
+    BoolLogic.generate_mixed_dataset_and_save(num_samples=2000000, depth=[3,4,5,6], verbose=[1,2,3], filename='bool_logic_dataset_train_mixed_x6.pkl')
+    # BoolLogic.generate_dataset_and_save(num_samples=1000000, depth=3, verbose=1, filename='bool_logic_dataset_train.pkl')
+    # BoolLogic.generate_dataset_and_save(num_samples=10000, depth=8, verbose=1, filename='bool_logic_dataset_val_d8_v1.pkl')
+    # BoolLogic.generate_dataset_and_save(num_samples=1000, depth=9, verbose=1, filename='bool_logic_dataset_val_d9_v1.pkl')
+    # BoolLogic.generate_dataset_and_save(num_samples=200, depth=20, verbose=1, filename='bool_logic_dataset_val_d20_v1.pkl')
+    # BoolLogic.generate_dataset_and_save(num_samples=100, depth=2, verbose=1, filename='bool_logic_dataset_val_d2_v1.pkl')
+    # BoolLogic.generate_dataset_and_save(num_samples=16, depth=1, verbose=1, filename='bool_logic_dataset_val_d1_v1.pkl')
+    # dataset = BoolLogic.load_dataset(filename='bool_logic_dataset_train.pkl')

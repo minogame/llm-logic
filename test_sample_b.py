@@ -3,7 +3,7 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
-from model import GPTConfig, GPT
+from model_rope import GPTConfig, GPT
 from data_generator_bool import BoolLogic as Dataset, BoolLogicTokenizer as Tokenizer
 
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
@@ -27,7 +27,7 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-model_name = 'ckpt_l2_mixed_x6_iter_2000.pt'
+model_name = 'ckpt_rope_l2_mixed_x6_iter_2000.pt'
 # init from a model saved in a specific directory
 ckpt_path = os.path.join(out_dir, model_name)
 checkpoint = torch.load(ckpt_path, map_location=device)
@@ -71,7 +71,7 @@ for dataset_val, num_samples in zip(['bool_logic_dataset_val_d1_v1.pkl', 'bool_l
                 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
                 y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-                output = tokenizer.detokenize(y[0].tolist()).split('E')[0]  # Remove end token
+                output = tokenizer.detokenize(y[0].tolist()).split('E')[0]
                 outfile.write(f"Detokenized output: {output}\n")
                 outfile.write('---------------\n')
 

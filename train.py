@@ -17,7 +17,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # specify which GPUs to use, e.g. '0,1' for two GPUs
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'  # specify which GPUs to use, e.g. '0,1' for two GPUs
 import time
 import math
 import pickle
@@ -28,7 +28,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model_rope import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -48,24 +48,24 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+block_size = 1536
 # model
-n_layer = 1
+n_layer = 2
 n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 2000 # total number of training iterations
+max_iters = 40000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 20 # how many steps to warm up for
-lr_decay_iters = 2000 # should be ~= max_iters per Chinchilla
+warmup_iters = 400 # how many steps to warm up for
+lr_decay_iters = 40000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -115,8 +115,8 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # poor man's data loader
 from data_generator_bool import BoolLogic as Dataset, BoolLogicTokenizer as Tokenizer
 tokenizer = Tokenizer()
-data_train = Dataset.load_dataset(filename='bool_logic_dataset_train.pkl')
-data_val = Dataset.load_dataset(filename='bool_logic_dataset_val.pkl')
+data_train = Dataset.load_dataset(filename='bool_logic_dataset_train_mixed_x6.pkl') #
+data_val = Dataset.load_dataset(filename='bool_logic_dataset_val_d7_v1.pkl')
 data_train['offset'] = 0
 data_val['offset'] = 0
 
@@ -149,10 +149,10 @@ def get_batch(split):
         x_to_stack.append(torch.from_numpy(np.array(tokenized_expression, dtype=np.int64)))
         y_to_stack.append(torch.from_numpy(np.array(target_expression, dtype=np.int64)))
 
-        x = torch.stack(x_to_stack)
-        y = torch.stack(y_to_stack)
-        loss_mask = torch.stack(loss_mask_to_stack)
-        x, y, loss_mask = x.to(device), y.to(device), loss_mask.to(device)
+    x = torch.stack(x_to_stack)
+    y = torch.stack(y_to_stack)
+    loss_mask = torch.stack(loss_mask_to_stack)
+    x, y, loss_mask = x.to(device), y.to(device), loss_mask.to(device)
 
     data['offset'] += batch_size
     if data['offset'] + batch_size > len(data['tokenized_expressions']):
@@ -303,8 +303,12 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                if (iter_num) % 2000 == 0:
+                    print(f"saving checkpoint to {out_dir}")
+                    torch.save(checkpoint, os.path.join(out_dir, f'ckpt_rope_l2_mixed_x6_iter_{iter_num}.pt'))
+
+                del checkpoint 
+
     if iter_num == 0 and eval_only:
         break
 
