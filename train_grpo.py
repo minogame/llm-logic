@@ -30,16 +30,12 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model_rope import GPTConfig, GPT
 
-exp_name = 'rope_l1_init_345'
-log_file = open(f'train_log/{exp_name}.log', 'w')
-
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
 eval_interval = 100
-save_interval = 1000
-log_interval = 5
+log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
@@ -50,8 +46,8 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 8 # used to simulate larger batch sizes
-batch_size = 60 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1536
 # model
 n_layer = 1
@@ -61,7 +57,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 2000 # total number of training iterations
+max_iters = 5000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -119,8 +115,8 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # poor man's data loader
 from data_generator_bool import BoolLogic as Dataset, BoolLogicTokenizer as Tokenizer
 tokenizer = Tokenizer()
-data_train = Dataset.load_dataset(filename='datasets/bool_logic_dataset_train_345_init.pkl') #
-data_val = Dataset.load_dataset(filename='datasets/bool_logic_dataset_val_d7_v1.pkl')
+data_train = Dataset.load_dataset(filename='bool_logic_dataset_train_mixed_x6.pkl') #
+data_val = Dataset.load_dataset(filename='bool_logic_dataset_val_d7_v1.pkl')
 data_train['offset'] = 0
 data_val['offset'] = 0
 
@@ -136,7 +132,7 @@ def get_batch(split):
     loss_mask_to_stack = []
     for idx in range(batch_size):
         expression_idx = data['offset'] + idx
-        tokenized_expression = data['tokenized_expressions'][expression_idx][:]
+        tokenized_expression = data['tokenized_expressions'][expression_idx]
         if len(tokenized_expression) > block_size:
             # truncate the expression to fit into the block size
             tokenized_expression = tokenized_expression[-block_size:]
@@ -288,8 +284,6 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        log_file.write(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        log_file.write("\n")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -309,11 +303,9 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                if (iter_num) % save_interval == 0:
+                if (iter_num) % 2000 == 0:
                     print(f"saving checkpoint to {out_dir}")
-                    log_file.write(f"saving checkpoint to {out_dir}")
-                    log_file.write("\n")
-                    torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{exp_name}_{iter_num}.pt'))
+                    torch.save(checkpoint, os.path.join(out_dir, f'ckpt_rope_l2_mixed_x6_iter_{iter_num}.pt'))
 
                 del checkpoint 
 
@@ -358,8 +350,6 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-        log_file.write(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-        log_file.write("\n")
     iter_num += 1
     local_iter_num += 1
 
@@ -367,14 +357,102 @@ while True:
     if iter_num > max_iters:
         break
 
+
+
+# 2. 模拟一个奖励函数
+# 假设我们希望模型生成包含特定数字（例如 5）的序列
+def get_reward(sequence, target_number=5):
+    return 1.0 if target_number in sequence else 0.0
+
+# 3. GRPO 训练参数
+vocab_size = 20
+embedding_dim = 32
+hidden_dim = 64
+learning_rate = 0.001
+epochs = 100
+group_size = 8  # 每组生成的样本数量
+kl_beta = 0.1 # KL 散度惩罚系数
+
+# 初始化模型和优化器
+actor = SimpleActor(vocab_size, embedding_dim, hidden_dim)
+optimizer = optim.Adam(actor.parameters(), lr=learning_rate)
+
+# 克隆一个初始模型用于计算 KL 散度
+actor_ref = SimpleActor(vocab_size, embedding_dim, hidden_dim)
+actor_ref.load_state_dict(actor.state_dict())
+actor_ref.eval()
+
+# 4. GRPO 训练循环
+for epoch in range(epochs):
+    prompt = 0  # 假设我们的 prompt 总是从 0 开始
+
+    group_sequences = []
+    group_log_probs = []
+    group_rewards = []
+
+    # --- 生成一组样本 ---
+    for _ in range(group_size):
+        sequence, log_probs = actor.generate(prompt)
+        reward = get_reward(sequence)
+
+        group_sequences.append(sequence)
+        group_log_probs.append(log_probs)
+        group_rewards.append(reward)
+
+    group_rewards = torch.tensor(group_rewards, dtype=torch.float32)
+
+    # --- 计算优势 ---
+    mean_reward = group_rewards.mean()
+    advantages = group_rewards - mean_reward
+
+    # --- 计算策略损失和 KL 散度 ---
+    policy_loss = 0
+    kl_divergence = 0
+
+    for i in range(group_size):
+        # 重新计算当前策略下生成序列的对数概率
+        current_log_probs = []
+        input_tokens = torch.tensor([group_sequences[i][:-1]], dtype=torch.long)
+        logits, _ = actor(input_tokens)
+        dist = Categorical(logits=logits)
+        output_tokens = torch.tensor([group_sequences[i][1:]], dtype=torch.long)
+        
+        # 计算每个 token 的对数概率
+        log_prob_per_token = dist.log_prob(output_tokens)
+        current_log_probs_sum = log_prob_per_token.sum()
+
+        # 策略损失
+        policy_loss += -advantages[i] * current_log_probs_sum
+        
+        # KL 散度
+        with torch.no_grad():
+            ref_logits, _ = actor_ref(input_tokens)
+            ref_dist = Categorical(logits=ref_logits)
+            
+        kl_per_token = (dist.probs * (dist.logits - ref_dist.logits)).sum(dim=-1)
+        kl_divergence += kl_per_token.sum()
+
+
+    policy_loss /= group_size
+    kl_divergence /= group_size
+    
+    # 总损失
+    loss = policy_loss + kl_beta * kl_divergence
+
+    # --- 更新模型 ---
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if epoch % 10 == 0:
+        print(f"Epoch {epoch}: Mean Reward: {mean_reward.item():.3f}, Loss: {loss.item():.3f}")
+
+# --- 训练后生成一个样本看看效果 ---
+final_sequence, _ = actor.generate(0)
+final_reward = get_reward(final_sequence)
+print("\n--- 训练完成 ---")
+print(f"生成的序列: {final_sequence}")
+print(f"获得的奖励: {final_reward}")
+
 if ddp:
     destroy_process_group()
-
-k_s = list(globals().keys())
-
-for k in k_s:
-    if k in globals().keys():
-        if not k.startswith('_') and isinstance(globals()[k], (int, float, str, bool)):
-            log_file.write(f"{k}: {in globals()[k]}\n")
-
-log_file.close()

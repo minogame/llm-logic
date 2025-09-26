@@ -1,6 +1,7 @@
 import random
 import pickle
 import itertools
+import numpy as np
 
 class BoolLogicTokenizer:
     def __init__(self):
@@ -185,6 +186,104 @@ class BoolLogic:
             tokenized_expressions = pickle.load(f)
         return tokenized_expressions
 
+    @staticmethod
+    def generate_init_expression(expr, tokenizer, max_len=1536):
+        _expr = expr.split(BoolLogic.IMPLIES)[0]
+        ans = expr.split(BoolLogic.IMPLIES)[-1]
+
+        all_tokens = list(range(2, 16))
+        gen_length = max_len - len(_expr) - 4
+
+        rand_len = min(gen_length, np.random.randint(len(_expr)*0.5, len(_expr)*2))
+        expr_ = tokenizer.detokenize([random.choice(all_tokens) for _ in range(rand_len)])
+        expr = _expr + BoolLogic.IMPLIES + expr_ + BoolLogic.IMPLIES + ans
+
+        return expr, 1
+
+    @staticmethod
+    def evaluate_expression(expr, expr_):
+
+        label = expr[-2:] # ->T or ->F
+        label_ = expr_[-2:] # ->T or ->F
+        if label == label_:
+            return 1
+        else:
+            if label == '→T' or label == '→F':
+                return -1
+            else:
+                return -2
+
+    @staticmethod
+    def compute_statistics(score):
+        statistics = (
+            sum(1 for s in score if s == 1),      # num_correct
+            sum(1 for s in score if s == -1),     # num_incorrect
+            sum(1 for s in score if s == -2)      # num_invalid
+        )
+        return statistics
+
+    @staticmethod
+    def generate_init_expression_old(expr, tokenizer, max_len=1536):
+        _expr = expr.split(BoolLogic.IMPLIES)[0]
+
+        all_tokens = list(range(1, 16))
+        gen_length = max_len - len(_expr)
+
+        success = False
+        attempts = 0
+
+        while not success:
+            attempts += 1
+            expr_ = tokenizer.detokenize([random.choice(all_tokens) for _ in range(gen_length)])
+            if '→TE' in expr_:
+                expr_ = expr_.split('→TE')[0]
+                expr  = _expr + BoolLogic.IMPLIES + expr_ + '→TE'
+                success = True
+            elif '→FE' in expr_:
+                expr_ = expr_.split('→FE')[0]
+                expr  = _expr + BoolLogic.IMPLIES + expr_ + '→FE'
+                success = True
+            else:
+                pass
+                
+        return expr, attempts
+
+
+    @staticmethod
+    def generate_init_expressions_and_save(num_samples=1000000, depth=[3,4,5], filename='bool_logic_dataset.pkl'):
+        tokenizer = BoolLogicTokenizer()
+        tokenized_expressions = []
+        pos_implies = []
+
+        expressions = []
+
+        n_t = 0
+
+        while len(expressions) < num_samples:
+            d = random.choice(depth)
+            expr = BoolLogic.generate_expression(d, verbose = 999)
+            expr, n = BoolLogic.generate_init_expression(expr, tokenizer)
+            expressions.append(expr),
+            n_t += n
+
+        print(f"Tokenizing expressions...")
+        for e in expressions:
+            tokenized_experssion = tokenizer.tokenize(e)
+            tokenized_experssion.append(tokenizer.tokens['E'])  # Append end token
+
+            tokenized_expressions.append(tokenized_experssion)
+
+            first_implies = tokenized_experssion.index(tokenizer.tokens[BoolLogic.IMPLIES])
+            pos_implies.append(first_implies)
+
+        dataset = dict()
+        dataset['expressions'] = expressions
+        dataset['tokenized_expressions'] = tokenized_expressions
+        dataset['pos_implies'] = pos_implies
+
+        with open(filename, 'wb') as f:
+            pickle.dump(dataset, f)
+
 if __name__ == "__main__":
     # # Example usage
     # expressions = BoolLogic.generate_expressions(num_samples=1000, depth=5, verbose=1)
@@ -192,7 +291,12 @@ if __name__ == "__main__":
     # for expr in expressions:
     #     print(expr)
 
-    BoolLogic.generate_mixed_dataset_and_save(num_samples=2000000, depth=[3,4,5,6], verbose=[1,2,3], filename='bool_logic_dataset_train_mixed_x6.pkl')
+    # BoolLogic.generate_mixed_dataset_and_save(num_samples=2000000, depth=[3,4,5,6], verbose=[1,2,3], filename='bool_logic_dataset_train_mixed_x6.pkl')
+
+    # BoolLogic.generate_init_expressions_and_save(num_samples=1000000, filename='bool_logic_dataset_train_345_init.pkl')
+    for idx in range(100):
+        print(f"{idx}", end=' ', flush=True)
+        BoolLogic.generate_init_expressions_and_save(num_samples=1000, filename=f'datasets_sampling/bool_logic_dataset_train_345_grpo_sampling_{idx}.pkl')
     # BoolLogic.generate_dataset_and_save(num_samples=1000000, depth=3, verbose=1, filename='bool_logic_dataset_train.pkl')
     # BoolLogic.generate_dataset_and_save(num_samples=10000, depth=8, verbose=1, filename='bool_logic_dataset_val_d8_v1.pkl')
     # BoolLogic.generate_dataset_and_save(num_samples=1000, depth=9, verbose=1, filename='bool_logic_dataset_val_d9_v1.pkl')

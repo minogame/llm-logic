@@ -30,7 +30,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model_rope import GPTConfig, GPT
 
-exp_name = 'rope_l1_init_345'
+exp_name = 'rope_l1_init_345_loss_mask_10'
 log_file = open(f'train_log/{exp_name}.log', 'w')
 
 # -----------------------------------------------------------------------------
@@ -38,9 +38,9 @@ log_file = open(f'train_log/{exp_name}.log', 'w')
 # I/O
 out_dir = 'out'
 eval_interval = 100
-save_interval = 1000
+save_interval = 100
 log_interval = 5
-eval_iters = 200
+eval_iters = 100
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -61,14 +61,14 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 2000 # total number of training iterations
+max_iters = 500 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 400 # how many steps to warm up for
+warmup_iters = 40 # how many steps to warm up for
 lr_decay_iters = 40000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
@@ -108,7 +108,7 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+torch.manual_seed(1337 + seed_offset + int(time.time()))
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -120,7 +120,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 from data_generator_bool import BoolLogic as Dataset, BoolLogicTokenizer as Tokenizer
 tokenizer = Tokenizer()
 data_train = Dataset.load_dataset(filename='datasets/bool_logic_dataset_train_345_init.pkl') #
-data_val = Dataset.load_dataset(filename='datasets/bool_logic_dataset_val_d7_v1.pkl')
+data_val = data_train # Dataset.load_dataset(filename='datasets/bool_logic_dataset_val_d7_v1.pkl')
 data_train['offset'] = 0
 data_val['offset'] = 0
 
@@ -147,8 +147,15 @@ def get_batch(split):
             target_expression = tokenized_expression[1:] + [tokenizer.tokens[' ']]  # shift by one for target
 
         loss_mask = [0] * data['pos_implies'][expression_idx] + \
-                    [1] * (len(data['tokenized_expressions'][expression_idx]) - data['pos_implies'][expression_idx]) + \
-                    [0] * (block_size - len(data['tokenized_expressions'][expression_idx]) - 1)
+                    [1] * (len(data['tokenized_expressions'][expression_idx]) - data['pos_implies'][expression_idx] - 4) + \
+                    [1] * 3 + \
+                    [0] * (block_size - len(data['tokenized_expressions'][expression_idx]) + 1)
+
+        # print(f"Tokenized expression: {tokenized_expression}")
+        # print(f"loss_mask: {loss_mask}")
+
+        # exit()
+
         loss_mask_to_stack.append(torch.tensor(loss_mask, dtype=torch.float32))
         x_to_stack.append(torch.from_numpy(np.array(tokenized_expression, dtype=np.int64)))
         y_to_stack.append(torch.from_numpy(np.array(target_expression, dtype=np.int64)))
@@ -237,7 +244,7 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
-@torch.no_grad()
+# @torch.no_grad()
 def estimate_loss():
     out = {}
     model.eval()
@@ -246,7 +253,24 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y, loss_mask = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y, loss_mask=loss_mask)
+                logits, loss, tok_emb_grad = model(X, Y, loss_mask=loss_mask)
+                # draw a figure for tok_emb_grad
+                # import matplotlib.pyplot as plt
+
+                # tok_emb_grad *= loss_mask.unsqueeze(-1)
+                # for z in range(10):
+                #     # Print X[z] and loss_mask[z] without truncation
+                #     np.set_printoptions(threshold=np.inf)
+                #     print(f'X[{z}]: {X[z].cpu().numpy()}')
+                #     print(f'loss_mask[{z}]: {loss_mask[z].cpu().numpy()}')
+                #     # np.set_printoptions(threshold=1000)  # reset to default
+                #     print('=' * 80)
+                #     arr = tok_emb_grad.cpu().numpy()[z, :100].T
+                #     plt.imshow(arr, aspect='auto', cmap='viridis', interpolation='nearest')
+                #     plt.colorbar()
+                #     plt.title('Token Embedding Gradient Norms')
+                #     plt.savefig(f'log/tok_emb_grad_{split}_{k}_{z}.png')
+                #     plt.clf()
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -330,7 +354,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y, loss_mask=loss_mask)
+            logits, loss, tok_emb_grad = model(X, Y, loss_mask=loss_mask)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y, loss_mask = get_batch('train')
@@ -375,6 +399,6 @@ k_s = list(globals().keys())
 for k in k_s:
     if k in globals().keys():
         if not k.startswith('_') and isinstance(globals()[k], (int, float, str, bool)):
-            log_file.write(f"{k}: {in globals()[k]}\n")
+            log_file.write(f"{k}: {globals()[k]}\n")
 
 log_file.close()

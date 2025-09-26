@@ -29,7 +29,7 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-model_name = 'ckpt_rope_l1_init_345_loss_mask_300.pt'
+model_name = 'ckpt_rope_l1_init_345_loss_mask_400.pt'
 # init from a model saved in a specific directory
 ckpt_path = os.path.join(out_dir, model_name)
 checkpoint = torch.load(ckpt_path, map_location=device)
@@ -46,25 +46,22 @@ model.eval()
 model.to(device)
 
 tokenizer = Tokenizer()
-
-
-# for dataset_val, num_samples in zip(['bool_logic_dataset_val_d1_v1.pkl', 'bool_logic_dataset_val_d2_v1.pkl', 'bool_logic_dataset_val_d3_v1.pkl',
-#                     'bool_logic_dataset_val_d4_v1.pkl', 'bool_logic_dataset_val_d5_v1.pkl', 'bool_logic_dataset_val_d6_v1.pkl',
-#                     'bool_logic_dataset_val_d7_v1.pkl', 'bool_logic_dataset_val_d8_v1.pkl', 'bool_logic_dataset_val_d9_v1.pkl'],
-#                     [16, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100]):
+outfile = open(f'log/test_acc_{model_name}.txt', 'w')
 
 for dataset_val, num_samples in zip(['bool_logic_dataset_val_d1_v1.pkl', 'bool_logic_dataset_val_d2_v1.pkl', 'bool_logic_dataset_val_d3_v1.pkl',
                     'bool_logic_dataset_val_d4_v1.pkl', 'bool_logic_dataset_val_d5_v1.pkl', 'bool_logic_dataset_val_d6_v1.pkl'],
-                    [16, 100, 100, 100, 100, 100, 100, 100, 100, 100]):
+                    [16, 100, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000]):
     print(f"Loading dataset: {dataset_val}")
     data_val = Dataset.load_dataset(filename=f'datasets/{dataset_val}')
 
-    outfile = open(f'log/test_{model_name}_sample_{dataset_val}.txt', 'w')
+    accurate = 0
     
     with torch.no_grad():
         with ctx:
             for k in range(num_samples):
                 test_expression = data_val['expressions'][k]
+                test_label = test_expression[-2:] # ->T or ->F
+
                 outfile.write(f"Original expression: {test_expression}\n")
                 test_expression = test_expression.split(Dataset.IMPLIES)[0] + Dataset.IMPLIES
                 start_ids = tokenizer.tokenize(test_expression)
@@ -73,8 +70,15 @@ for dataset_val, num_samples in zip(['bool_logic_dataset_val_d1_v1.pkl', 'bool_l
 
                 y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
                 output = tokenizer.detokenize(y[0].tolist()).split('E')[0]
-                outfile.write(f"Detokenized outputs: {output}\n")
-                outfile.write('---------------\n')
 
-    outfile.close()
+                pred_label = output[-2:] # ->T or ->F
+                if pred_label == test_label:
+                    accurate += 1
+
+    outfile.write(f"Dataset: {dataset_val}\n")
+    outfile.write(f"Test accuracy: {accurate}/{num_samples} = {accurate/num_samples*100:.2f}%\n")
+    print(f"Dataset: {dataset_val}")
+    print(f"Test accuracy: {accurate}/{num_samples} = {accurate/num_samples*100:.2f}%")
+
+outfile.close()
 

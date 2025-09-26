@@ -37,17 +37,13 @@ log_file = open(f'train_log/{exp_name}.log', 'w')
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
+ckpt_path = os.path.join(out_dir, 'ckpt_rope_l1_init_345_loss_mask_400.pt')
 eval_interval = 100
 save_interval = 1000
 log_interval = 5
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
-# wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 8 # used to simulate larger batch sizes
@@ -124,12 +120,8 @@ data_val = Dataset.load_dataset(filename='datasets/bool_logic_dataset_val_d7_v1.
 data_train['offset'] = 0
 data_val['offset'] = 0
 
-def get_batch(split):
-
-    if split == 'train':
-        data = data_train
-    elif split == 'val':
-        data = data_val
+def get_batch_val():
+    data = data_val
 
     x_to_stack = []
     y_to_stack = []
@@ -166,51 +158,69 @@ def get_batch(split):
 
     return x, y, loss_mask
 
-# init these up here, can override if init_from='resume' (i.e. from a checkpoint)
+def get_batch_train():
+    data = data_train
+
+    x_to_stack = []
+    y_to_stack = []
+    loss_mask_to_stack = []
+    for idx in range(batch_size):
+        expression_idx = data['offset'] + idx
+        tokenized_expression = data['tokenized_expressions'][expression_idx][:]
+        if len(tokenized_expression) > block_size:
+            # truncate the expression to fit into the block size
+            tokenized_expression = tokenized_expression[-block_size:]
+            target_expression = tokenized_expression[1:] + [tokenizer.tokens[' ']]  # shift by one for target
+        else:
+            # pad the expression to fit into the block size
+            tokenized_expression += [tokenizer.tokens[' ']] * (block_size - len(tokenized_expression))
+            target_expression = tokenized_expression[1:] + [tokenizer.tokens[' ']]  # shift by one for target
+
+
+
+def get_batch(split):
+
+    if split == 'train':
+        return get_batch_train()
+    elif split == 'val':
+        return get_batch_val()
+
 iter_num = 0
 best_val_loss = 1e9
 
-# model init
+# model init: create an actor (trainable) and an actor_ref (frozen, not trained) copy
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
-if init_from == 'scratch':
-    # init a new model from scratch
-    print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    model_args['vocab_size'] = tokenizer.vocab_size
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
+
+print(f"Loading actor from {ckpt_path}")
+checkpoint = torch.load(ckpt_path, map_location=device)
+checkpoint_model_args = checkpoint['model_args']
+# force these config attributes to be equal otherwise we can't even resume training
+for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    model_args[k] = checkpoint_model_args[k]
+# create the actor and load weights
+gptconf = GPTConfig(**model_args)
+actor = GPT(gptconf)
+state_dict = checkpoint['model']
+# fix the keys of the state dictionary if needed
+unwanted_prefix = '_orig_mod.'
+for k,v in list(state_dict.items()):
+    if k.startswith(unwanted_prefix):
+        state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+actor.load_state_dict(state_dict)
+# create actor_ref as a frozen copy
+actor_ref = GPT(GPTConfig(**model_args))
+actor_ref.load_state_dict(actor.state_dict())
+iter_num = checkpoint.get('iter_num', 0)
+best_val_loss = checkpoint.get('best_val_loss', best_val_loss)
+
+# freeze actor_ref (no training)
+actor_ref.eval()
+for p in actor_ref.parameters():
+    p.requires_grad = False
+
+# use 'model' name for the training actor to keep the rest of the script unchanged
+model = actor
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -222,8 +232,7 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
+# optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
 # compile the model
@@ -266,11 +275,6 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
-# logging
-if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
-
 # training loop
 X, Y, loss_mask = get_batch('train') # fetch the very first batch
 t0 = time.time()
@@ -290,14 +294,7 @@ while True:
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         log_file.write(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         log_file.write("\n")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
+
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:

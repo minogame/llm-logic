@@ -219,38 +219,177 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, loss_mask=None):
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+    def forward_grpo(self, group_sequences, group_rewards, actor_ref, kl_beta, loss_mask=None):
+        """
+        GRPO style objective:
+            - advantages = rewards - mean(rewards)
+            - policy loss = - E[ advantages * log pi(a_{1:T} | s) ]
+            - kl penalty = kl_beta * E[ KL( pi || pi_ref ) ] (averaged per sequence)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        Args:
+            group_sequences: iterable of token id lists (each a generated sequence)
+            group_rewards: iterable of floats (one reward per sequence)
+            actor_ref: reference policy (a GPT instance, parameters should be frozen/eval)
+            kl_beta: scalar coefficient for KL penalty
+            loss_mask: not used here (kept for API compatibility)
+        Returns:
+            loss (torch.Tensor) that can be backpropagated, plus diagnostics (policy_loss, kl_div)
+        """
+        device = next(self.parameters()).device
+        group_size = len(group_sequences)
+        if group_size == 0:
+            raise ValueError("group_sequences must be non-empty")
 
-        x = self.transformer.drop(tok_emb)
+        # to tensor on correct device
+        group_rewards = torch.tensor(group_rewards, dtype=torch.float32, device=device)
+        advantages = group_rewards - group_rewards.mean()
 
-        freqs_cis = self.freqs_cis.to(device)
-        freqs_cis = freqs_cis[:t]
+        policy_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+        kl_divergence = torch.tensor(0.0, dtype=torch.float32, device=device)
 
-        for block in self.transformer.h:
-            x = block(x, freqs_cis)
-        x = self.transformer.ln_f(x)
+        # Process each sequence independently (handles variable lengths)
+        for i, seq in enumerate(group_sequences):
+            seq = list(seq)
+            if len(seq) < 2:
+                continue  # nothing to do for sequences of length < 2
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
+            input_ids = torch.tensor([seq[:-1]], dtype=torch.long, device=device)   # shape (1, T)
+            targets = torch.tensor([seq[1:]], dtype=torch.long, device=device)      # shape (1, T)
+            T = input_ids.size(1)
+
+            # slice rotary freqs to sequence length
+            freqs_cis = self.freqs_cis.to(device)[:T]
+
+            # forward current policy to get logits (1, T, V)
+            x = self.transformer.wte(input_ids)
+            x = self.transformer.drop(x)
+            for block in self.transformer.h:
+                x = block(x, freqs_cis)
+            x = self.transformer.ln_f(x)
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
-            if loss_mask is not None:
-                loss = loss * loss_mask.view(-1)
 
-            loss = loss.mean()
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+            # log probs and per-token log-prob for the taken actions
+            log_probs = F.log_softmax(logits, dim=-1)           # (1, T, V)
+            tok_log_probs = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)  # (1, T)
+            seq_logprob = tok_log_probs.sum()                   # scalar
 
-        return logits, loss
+            # accumulate policy loss (weighted by advantage)
+            adv = advantages[i].to(device)
+            policy_loss = policy_loss + (-adv * seq_logprob)
+
+            # compute KL(pi || pi_ref) per-token and sum across tokens
+            with torch.no_grad():
+                # reference logits under actor_ref
+                xr = actor_ref.transformer.wte(input_ids)
+                xr = actor_ref.transformer.drop(xr)
+                for block in actor_ref.transformer.h:
+                    xr = block(xr, freqs_cis)
+                xr = actor_ref.transformer.ln_f(xr)
+                ref_logits = actor_ref.lm_head(xr)
+                ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+
+            cur_probs = F.softmax(logits, dim=-1)               # (1, T, V)
+            kl_per_token = (cur_probs * (log_probs - ref_log_probs)).sum(dim=-1)  # (1, T)
+            kl_seq = kl_per_token.sum()
+            kl_divergence = kl_divergence + kl_seq
+
+        # average over group
+        policy_loss = policy_loss / group_size
+        kl_divergence = kl_divergence / group_size
+
+        loss = policy_loss + kl_beta * kl_divergence
+
+        return loss, policy_loss.detach(), kl_divergence.detach()
+
+    def forward_offline_grpo(self, group_sequences, group_rewards, actor_ref, kl_beta, behavior_log_probs=None, use_is=False):
+        """
+        Offline GRPO: 假定采样已经完成，传入一组序列及其 reward （可选 behavior_log_probs 用于重要性采样）。
+        参数:
+            group_sequences: iterable of token id lists (each a generated sequence)
+            group_rewards: iterable of floats (one reward per sequence)
+            actor_ref: reference policy (GPT 实例，参数应被冻结/eval)
+            kl_beta: scalar coefficient for KL penalty
+            behavior_log_probs: optional iterable of floats (log prob of each full sequence under behavior policy)
+            use_is: bool 是否启用重要性采样校正（需要 behavior_log_probs）
+        返回:
+            loss, policy_loss.detach(), kl_divergence.detach()
+        """
+        device = next(self.parameters()).device
+        group_size = len(group_sequences)
+        if group_size == 0:
+            raise ValueError("group_sequences must be non-empty")
+
+        group_rewards = torch.tensor(group_rewards, dtype=torch.float32, device=device)
+        advantages = group_rewards - group_rewards.mean()
+
+        policy_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+        kl_divergence = torch.tensor(0.0, dtype=torch.float32, device=device)
+
+        if behavior_log_probs is not None:
+            if len(behavior_log_probs) != group_size:
+                raise ValueError("behavior_log_probs length must match group_sequences")
+            behavior_log_probs = torch.tensor(behavior_log_probs, dtype=torch.float32, device=device)
+
+        for i, seq in enumerate(group_sequences):
+            seq = list(seq)
+            if len(seq) < 2:
+                continue
+
+            input_ids = torch.tensor([seq[:-1]], dtype=torch.long, device=device)   # (1, T)
+            targets = torch.tensor([seq[1:]], dtype=torch.long, device=device)      # (1, T)
+            T = input_ids.size(1)
+
+            freqs_cis = self.freqs_cis.to(device)[:T]
+
+            # forward current policy
+            x = self.transformer.wte(input_ids)
+            x = self.transformer.drop(x)
+            for block in self.transformer.h:
+                x = block(x, freqs_cis)
+            x = self.transformer.ln_f(x)
+            logits = self.lm_head(x)
+
+            log_probs = F.log_softmax(logits, dim=-1)           # (1, T, V)
+            tok_log_probs = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)  # (1, T)
+            seq_logprob = tok_log_probs.sum()                   # scalar
+
+            with torch.no_grad():
+                xr = actor_ref.transformer.wte(input_ids)
+                xr = actor_ref.transformer.drop(xr)
+                for block in actor_ref.transformer.h:
+                    xr = block(xr, freqs_cis)
+                xr = actor_ref.transformer.ln_f(xr)
+                ref_logits = actor_ref.lm_head(xr)
+                ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+
+            # accumulate policy loss (weighted by advantage, possibly with IS correction)
+            adv = advantages[i].to(device)
+            if use_is and behavior_log_probs is not None:
+                # importance weight = exp(cur_logprob - behavior_logprob)
+                is_ratio = torch.exp(seq_logprob - behavior_log_probs[i].to(device))
+                policy_loss = policy_loss + (-adv * is_ratio * seq_logprob)
+            elif use_is and behavior_log_probs is None:
+                # use sum of ref_log_probs as a proxy for behavior log prob
+                ref_tok_log_probs = ref_log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1) # (1, T)
+                ref_seq_logprob = ref_tok_log_probs.sum()
+                is_ratio = torch.exp(seq_logprob - ref_seq_logprob)
+                policy_loss = policy_loss + (-adv * is_ratio * seq_logprob)
+            else:
+                policy_loss = policy_loss + (-adv * seq_logprob)
+
+            # compute KL(pi || pi_ref)
+            cur_probs = F.softmax(logits, dim=-1)           # (1, T, V)
+            kl_per_token = (cur_probs * (log_probs - ref_log_probs)).sum(dim=-1)  # (1, T)
+            kl_seq = kl_per_token.sum()
+            kl_divergence = kl_divergence + kl_seq
+
+        # average over group
+        policy_loss = policy_loss / group_size
+        kl_divergence = kl_divergence / group_size
+
+        loss = policy_loss + kl_beta * kl_divergence
+
+        return loss, policy_loss.detach(), kl_divergence.detach()
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -373,7 +512,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -386,5 +525,42 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
+
+            if idx_next.item() == 1: # if sampled the <EOS> token, stop here
+                break
+
+        return idx
+
+
+    @torch.no_grad()
+    def batch_generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        batch_eos = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+            batch_eos = batch_eos | (idx_next.view(-1) == 1) # if sampled the <EOS> token
+            if torch.all(batch_eos): # if all in the batch have finished, stop here
+                batch_finished = True
+                break
 
         return idx
