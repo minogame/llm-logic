@@ -375,6 +375,6 @@ k_s = list(globals().keys())
 for k in k_s:
     if k in globals().keys():
         if not k.startswith('_') and isinstance(globals()[k], (int, float, str, bool)):
-            log_file.write(f"{k}: {in globals()[k]}\n")
+            log_file.write(f"{k}: {globals()[k]}\n")
 
 log_file.close()

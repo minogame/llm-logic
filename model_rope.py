@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import numpy as np
 
 def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str = 'cpu', theta: float = 10000.0):
     """
@@ -162,10 +163,6 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
-
-
-
-
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -301,95 +298,166 @@ class GPT(nn.Module):
 
         return loss, policy_loss.detach(), kl_divergence.detach()
 
-    def forward_offline_grpo(self, group_sequences, group_rewards, actor_ref, kl_beta, behavior_log_probs=None, use_is=False):
+    def forward_offline_grpo(self, group_sequences, group_targets, group_masks, group_rewards, actor_ref, kl_beta, behavior_log_probs=None, use_is=False, debug=False):
         """
-        Offline GRPO: 假定采样已经完成，传入一组序列及其 reward （可选 behavior_log_probs 用于重要性采样）。
-        参数:
-            group_sequences: iterable of token id lists (each a generated sequence)
-            group_rewards: iterable of floats (one reward per sequence)
-            actor_ref: reference policy (GPT 实例，参数应被冻结/eval)
+        Offline GRPO: Assumes sampling is already done, and a set of sequences and their rewards are passed in
+        (optional behavior_log_probs for importance sampling).
+        Args:
+            group_sequences: a batch of iterable of token id lists (each a generated sequence)
+            group_targets: a batch of iterable of token id lists (each the target tokens, shifted by 1)
+            group_mask: a batch of iterable of floats (1.0 for tokens to include in loss, 0.0 to ignore)
+            group_rewards: a batch iterable of floats (one reward per sequence)
+            actor_ref: reference policy (GPT instance, parameters should be frozen/eval)
             kl_beta: scalar coefficient for KL penalty
             behavior_log_probs: optional iterable of floats (log prob of each full sequence under behavior policy)
-            use_is: bool 是否启用重要性采样校正（需要 behavior_log_probs）
-        返回:
+            use_is: bool, whether to enable importance sampling correction (requires behavior_log_probs)
+        Returns:
             loss, policy_loss.detach(), kl_divergence.detach()
         """
         device = next(self.parameters()).device
-        group_size = len(group_sequences)
-        if group_size == 0:
-            raise ValueError("group_sequences must be non-empty")
 
-        group_rewards = torch.tensor(group_rewards, dtype=torch.float32, device=device)
-        advantages = group_rewards - group_rewards.mean()
+        # compute advantages per sequence and flatten into a single vector
+        group_advantages = []
+        for rewards in group_rewards:
+            rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+            advantages = rewards - rewards.mean()
+            group_advantages.append(advantages)
+        group_advantages = torch.stack(group_advantages).flatten()
+        advantages = group_advantages.to(device)
+        
+        # optional debug printing of all advantage values (disabled by default)
+        # prev_opts = np.get_printoptions()
+        # ensure full printing of large arrays
+        # try:
+        #     np.set_printoptions(threshold=np.inf)
+        #     print("advantages:", advantages.detach().cpu().numpy())
+        # finally:
+        #     np.set_printoptions(**prev_opts)
 
-        policy_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
-        kl_divergence = torch.tensor(0.0, dtype=torch.float32, device=device)
+        # exit()
 
         if behavior_log_probs is not None:
-            if len(behavior_log_probs) != group_size:
-                raise ValueError("behavior_log_probs length must match group_sequences")
-            behavior_log_probs = torch.tensor(behavior_log_probs, dtype=torch.float32, device=device)
+            behavior_log_probs = torch.stack(behavior_log_probs).flatten().to(device)
 
-        for i, seq in enumerate(group_sequences):
-            seq = list(seq)
-            if len(seq) < 2:
-                continue
+        # Pad sequences and create masks
+        input_ids_batch = group_sequences.view(-1, group_sequences.size(-1)).long().to(device)  # (B, G ,T) -> (B*G, T)   
+        targets_batch = group_targets.view(-1, group_targets.size(-1)).long().to(device)      # (B, G, T) -> (B*G, T)
+        attention_masks = group_masks.view(-1, group_masks.size(-1)).float().to(device)  # (B, G, T) -> (B*G, T)
 
-            input_ids = torch.tensor([seq[:-1]], dtype=torch.long, device=device)   # (1, T)
-            targets = torch.tensor([seq[1:]], dtype=torch.long, device=device)      # (1, T)
-            T = input_ids.size(1)
+        BG, T = input_ids_batch.shape
+        freqs_cis = self.freqs_cis.to(device)[:T]
 
-            freqs_cis = self.freqs_cis.to(device)[:T]
+        # Forward pass through current policy
+        x = self.transformer.wte(input_ids_batch)
+        x = self.transformer.drop(x)
+        for block in self.transformer.h:
+            x = block(x, freqs_cis)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)  # (B, T, V)
 
-            # forward current policy
-            x = self.transformer.wte(input_ids)
-            x = self.transformer.drop(x)
-            for block in self.transformer.h:
-                x = block(x, freqs_cis)
-            x = self.transformer.ln_f(x)
-            logits = self.lm_head(x)
+        # Compute log probabilities and gather token log-probs
+        log_probs = F.log_softmax(logits, dim=-1)  # (B, T, V)
+        tok_log_probs = log_probs.gather(-1, targets_batch.unsqueeze(-1)).squeeze(-1)  # (B, T)
+        tok_log_probs = tok_log_probs * attention_masks
+        seq_log_probs = tok_log_probs.sum(dim=1)  # (B,)
 
-            log_probs = F.log_softmax(logits, dim=-1)           # (1, T, V)
-            tok_log_probs = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)  # (1, T)
-            seq_logprob = tok_log_probs.sum()                   # scalar
+        # Forward pass through reference policy
+        with torch.no_grad():
+            xr = actor_ref.transformer.wte(input_ids_batch)
+            xr = actor_ref.transformer.drop(xr)
+            for block in actor_ref.transformer.h:
+                xr = block(xr, freqs_cis)
+            xr = actor_ref.transformer.ln_f(xr)
+            ref_logits = actor_ref.lm_head(xr)  # (B, T, V)
+            ref_log_probs = F.log_softmax(ref_logits, dim=-1)  # (B, T, V)
 
-            with torch.no_grad():
-                xr = actor_ref.transformer.wte(input_ids)
-                xr = actor_ref.transformer.drop(xr)
-                for block in actor_ref.transformer.h:
-                    xr = block(xr, freqs_cis)
-                xr = actor_ref.transformer.ln_f(xr)
-                ref_logits = actor_ref.lm_head(xr)
-                ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+        clip_epsilon = 0.2
+        # Compute policy loss with optional importance sampling
+        if use_is and behavior_log_probs is not None:
+            # Importance weights = exp(current_logprob - behavior_logprob)
+            is_ratios = torch.exp(seq_log_probs - behavior_log_probs)
+            is_ratios = torch.clamp(is_ratios, 1 - clip_epsilon, 1 + clip_epsilon)
+            policy_losses = -advantages * is_ratios.detach() * seq_log_probs
+        elif use_is and behavior_log_probs is None:
+            # Use reference log probs as proxy for behavior log prob
+            ref_tok_log_probs = ref_log_probs.gather(-1, targets_batch.unsqueeze(-1)).squeeze(-1)  # (B, T)
+            ref_tok_log_probs = ref_tok_log_probs * attention_masks
+            ref_seq_log_probs = ref_tok_log_probs.sum(dim=1)  # (B,)
+            is_ratios = torch.exp(seq_log_probs - ref_seq_log_probs)
+            is_ratios = torch.clamp(is_ratios, 1 - clip_epsilon, 1 + clip_epsilon)
+            policy_losses = -advantages * is_ratios.detach() * seq_log_probs / group_sequences.size(-1)
+        else:
+            policy_losses = -advantages * seq_log_probs
 
-            # accumulate policy loss (weighted by advantage, possibly with IS correction)
-            adv = advantages[i].to(device)
-            if use_is and behavior_log_probs is not None:
-                # importance weight = exp(cur_logprob - behavior_logprob)
-                is_ratio = torch.exp(seq_logprob - behavior_log_probs[i].to(device))
-                policy_loss = policy_loss + (-adv * is_ratio * seq_logprob)
-            elif use_is and behavior_log_probs is None:
-                # use sum of ref_log_probs as a proxy for behavior log prob
-                ref_tok_log_probs = ref_log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1) # (1, T)
-                ref_seq_logprob = ref_tok_log_probs.sum()
-                is_ratio = torch.exp(seq_logprob - ref_seq_logprob)
-                policy_loss = policy_loss + (-adv * is_ratio * seq_logprob)
-            else:
-                policy_loss = policy_loss + (-adv * seq_logprob)
+        policy_loss = policy_losses.mean()
 
-            # compute KL(pi || pi_ref)
-            cur_probs = F.softmax(logits, dim=-1)           # (1, T, V)
-            kl_per_token = (cur_probs * (log_probs - ref_log_probs)).sum(dim=-1)  # (1, T)
-            kl_seq = kl_per_token.sum()
-            kl_divergence = kl_divergence + kl_seq
+        # Compute KL divergence: KL(pi || pi_ref)
+        cur_probs = F.softmax(logits, dim=-1)  # (B, T, V)
+        kl_per_token = (cur_probs * (log_probs - ref_log_probs)).sum(dim=-1)  # (B, T)
 
-        # average over group
-        policy_loss = policy_loss / group_size
-        kl_divergence = kl_divergence / group_size
+        # Apply attention mask and sum over sequence length
+        kl_per_token = kl_per_token * attention_masks
+        kl_per_seq = kl_per_token.sum(dim=1)  # (B,)
+        kl_divergence = kl_per_seq.mean()
 
+        # Total loss
         loss = policy_loss + kl_beta * kl_divergence
 
         return loss, policy_loss.detach(), kl_divergence.detach()
+
+    def forward_pretrain(self, idx, targets=None, loss_mask=None):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        # Create one-hot encoding and set requires_grad=True
+        one_hot = F.one_hot(idx, num_classes=self.config.vocab_size).float().to(device)
+        # one_hot.requires_grad_(True)
+        
+        # forward the GPT model itself
+        tok_emb = torch.matmul(one_hot, self.transformer.wte.weight) # token embeddings of shape (b, t, n_embd)
+
+        x = self.transformer.drop(tok_emb)
+
+        freqs_cis = self.freqs_cis.to(device)
+        freqs_cis = freqs_cis[:t]
+
+        for block in self.transformer.h:
+            x = block(x, freqs_cis)
+        x = self.transformer.ln_f(x)
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
+            if loss_mask is not None:
+                loss = loss * loss_mask.view(-1)
+
+            loss = loss.sum()
+
+            # Compute gradients w.r.t. one_hot
+            grads = None
+            if one_hot.requires_grad:
+                grads = torch.autograd.grad(loss, one_hot, retain_graph=True)[0]
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            loss = None
+            grads = None
+
+        return logits, loss, grads
+
+    def forward(model, *args, mode='pretrain', **kwargs):
+        if mode == 'pretrain':
+            return model.forward_pretrain(*args, **kwargs)
+        elif mode == 'grpo':
+            return model.forward_grpo(*args, **kwargs)
+        elif mode == 'offline_grpo':
+            return model.forward_offline_grpo(*args, **kwargs)
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -397,7 +465,7 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        # self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
