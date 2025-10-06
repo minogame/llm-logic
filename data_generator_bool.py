@@ -124,12 +124,12 @@ class BoolLogic:
 
         print(f"Tokenizing expressions...")
         for e in expressions:
-            tokenized_experssion = tokenizer.tokenize(e)
-            tokenized_experssion.append(tokenizer.tokens['E'])  # Append end token
+            tokenized_expression = tokenizer.tokenize(e)
+            tokenized_expression.append(tokenizer.tokens['E'])  # Append end token
 
-            tokenized_expressions.append(tokenized_experssion)
+            tokenized_expressions.append(tokenized_expression)
 
-            first_implies = tokenized_experssion.index(tokenizer.tokens[BoolLogic.IMPLIES])
+            first_implies = tokenized_expression.index(tokenizer.tokens[BoolLogic.IMPLIES])
             pos_implies.append(first_implies)
 
         dataset = dict()
@@ -164,12 +164,12 @@ class BoolLogic:
 
         print(f"Tokenizing expressions...")
         for e in expressions:
-            tokenized_experssion = tokenizer.tokenize(e)
-            tokenized_experssion.append(tokenizer.tokens['E'])  # Append end token
+            tokenized_expression = tokenizer.tokenize(e)
+            tokenized_expression.append(tokenizer.tokens['E'])  # Append end token
 
-            tokenized_expressions.append(tokenized_experssion)
+            tokenized_expressions.append(tokenized_expression)
 
-            first_implies = tokenized_experssion.index(tokenizer.tokens[BoolLogic.IMPLIES])
+            first_implies = tokenized_expression.index(tokenizer.tokens[BoolLogic.IMPLIES])
             pos_implies.append(first_implies)
 
         dataset = dict()
@@ -201,18 +201,61 @@ class BoolLogic:
         return expr, 1
 
     @staticmethod
-    def evaluate_expression(expr, expr_):
+    def evaluate_expression_1(expr, expr_):
 
+        score = 0.0
         label = expr[-2:] # ->T or ->F
         label_ = expr_[-2:] # ->T or ->F
+
         if label == label_:
-            return 1
+            score += 1.5
         else:
             if label == '→T' or label == '→F':
-                return -1
+                score -= 0.5
             else:
-                return -2
+                score -= 1.0
+            
+        return score
 
+    @staticmethod
+    def evaluate_expression_2(expr, expr_):
+
+        score = 0.0
+        label = expr[-2:] # ->T or ->F
+        label_ = expr_[-2:] # ->T or ->F
+
+        len_prompt = len(expr.split(BoolLogic.IMPLIES)[0])
+        len_sample = len(expr) - len_prompt
+        len_sample_ = len(expr_) - len_prompt
+
+        if len_sample < len_sample_ // 2:
+            score -= 0.5
+        if len_sample < len_sample_ // 4:
+            score -= 1.0
+        if len_sample > len_sample_ * 2:
+            score -= 0.5
+
+        if label == label_:
+            score += 1.5
+        else:
+            if label == '→T' or label == '→F':
+                score -= 0.5
+            else:
+                score -= 0.5
+            
+        return score
+
+    @staticmethod
+    def evaluate_expression(expr, expr_, version=2):
+        if version == 1:
+            score = BoolLogic.evaluate_expression_1(expr, expr_)
+        elif version == 2:
+            score = BoolLogic.evaluate_expression_2(expr, expr_)
+        else:
+            raise NotImplementedError    
+        
+        return score
+    
     @staticmethod
     def compute_statistics(score):
         statistics = (
@@ -268,12 +311,12 @@ class BoolLogic:
 
         print(f"Tokenizing expressions...")
         for e in expressions:
-            tokenized_experssion = tokenizer.tokenize(e)
-            tokenized_experssion.append(tokenizer.tokens['E'])  # Append end token
+            tokenized_expression = tokenizer.tokenize(e)
+            tokenized_expression.append(tokenizer.tokens['E'])  # Append end token
 
-            tokenized_expressions.append(tokenized_experssion)
+            tokenized_expressions.append(tokenized_expression)
 
-            first_implies = tokenized_experssion.index(tokenizer.tokens[BoolLogic.IMPLIES])
+            first_implies = tokenized_expression.index(tokenizer.tokens[BoolLogic.IMPLIES])
             pos_implies.append(first_implies)
 
         dataset = dict()
@@ -294,9 +337,10 @@ if __name__ == "__main__":
     # BoolLogic.generate_mixed_dataset_and_save(num_samples=2000000, depth=[3,4,5,6], verbose=[1,2,3], filename='bool_logic_dataset_train_mixed_x6.pkl')
 
     # BoolLogic.generate_init_expressions_and_save(num_samples=1000000, filename='bool_logic_dataset_train_345_init.pkl')
-    for idx in range(100):
-        print(f"{idx}", end=' ', flush=True)
-        BoolLogic.generate_init_expressions_and_save(num_samples=1000, filename=f'datasets_sampling/bool_logic_dataset_train_345_grpo_sampling_{idx}.pkl')
+    # for idx in range(100):
+    #     print(f"{idx}", end=' ', flush=True)
+    #     BoolLogic.generate_init_expressions_and_save(num_samples=10000, filename=f'datasets_sampling_b/bool_logic_dataset_train_345_grpo_sampling_{idx}.pkl')
+    BoolLogic.generate_init_expressions_and_save(num_samples=10000000, filename=f'datasets_sampling_b/bool_logic_dataset_train_345_grpo_sampling.pkl')
     # BoolLogic.generate_dataset_and_save(num_samples=1000000, depth=3, verbose=1, filename='bool_logic_dataset_train.pkl')
     # BoolLogic.generate_dataset_and_save(num_samples=10000, depth=8, verbose=1, filename='bool_logic_dataset_val_d8_v1.pkl')
     # BoolLogic.generate_dataset_and_save(num_samples=1000, depth=9, verbose=1, filename='bool_logic_dataset_val_d9_v1.pkl')

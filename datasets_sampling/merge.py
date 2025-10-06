@@ -48,4 +48,7 @@ def merge_sampled_pickles(num_files: int = 100,
 
 
 if __name__ == "__main__":
-    merge_sampled_pickles()
+    merge_sampled_pickles(
+        input_template="datasets_sampling/bool_logic_dataset_train_345_grpo_sampling_{idx}.pkl",
+        output_path="datasets_sampling/bool_logic_dataset_train_345_grpo_sampling_merged.pkl"
+    )

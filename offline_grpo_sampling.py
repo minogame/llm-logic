@@ -9,6 +9,7 @@ from model_rope import GPTConfig, GPT
 from data_generator_bool import BoolLogic as Dataset, BoolLogicTokenizer as Tokenizer
 
 model_name = 'ckpt_rope_l1_init_345_loss_mask_400.pt'
+model_name = 'ckpt_rope_l1_offline_grpo_345_c_20.pt'
 dataset_sampling_id = 0 # which dataset to use for sampling, from 0 to 99
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume'
@@ -62,9 +63,11 @@ data_val['statistics'] = []
 def print_results(data_val):
 
     print("Sampled Expressions:")
-    print(data_val['sampled_expressions'])
-    print("Tokenized Sampled Expressions:")
-    print(data_val['tokenized_sampled_expressions'])
+    for d in data_val['sampled_expressions']:
+        print(d)
+    # print(data_val['sampled_expressions'])
+    # print("Tokenized Sampled Expressions:")
+    # print(data_val['tokenized_sampled_expressions'])
     print("Score:")
     print(data_val['score'])
     print("Statistics:")
@@ -72,7 +75,7 @@ def print_results(data_val):
 
 # Call this after your sampling loop
 
-num_samples = len(data_val['expressions'])
+num_samples = 1 # len(data_val['expressions'])
 
 with torch.no_grad():
     with ctx:
@@ -99,7 +102,9 @@ with torch.no_grad():
                 print(f".", end=' ', flush=True)
 
 print()
+print_results(data_val)
 
-dump_path = f'datasets_sampling/bool_logic_dataset_train_345_grpo_sampling_{dataset_sampling_id}_sampled.pkl'
-with open(dump_path, 'wb') as f:
-    pickle.dump(data_val, f)
+
+# dump_path = f'datasets_sampling/bool_logic_dataset_train_345_grpo_sampling_{dataset_sampling_id}_sampled.pkl'
+# with open(dump_path, 'wb') as f:
+#     pickle.dump(data_val, f)

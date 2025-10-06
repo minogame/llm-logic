@@ -216,7 +216,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward_grpo(self, group_sequences, group_rewards, actor_ref, kl_beta, loss_mask=None):
+    def forward_grpo(self, group_sequences, group_targets, group_masks, group_rewards):
         """
         GRPO style objective:
             - advantages = rewards - mean(rewards)
@@ -224,79 +224,63 @@ class GPT(nn.Module):
             - kl penalty = kl_beta * E[ KL( pi || pi_ref ) ] (averaged per sequence)
 
         Args:
-            group_sequences: iterable of token id lists (each a generated sequence)
-            group_rewards: iterable of floats (one reward per sequence)
-            actor_ref: reference policy (a GPT instance, parameters should be frozen/eval)
+            group_sequences: a batch of iterable of token id lists (each a generated sequence)
+            group_targets: a batch of iterable of token id lists (each the target tokens, shifted by 1)
+            group_mask: a batch of iterable of floats (1.0 for tokens to include in loss, 0.0 to ignore)
+            group_rewards: a batch iterable of floats (one reward per sequence)
+            actor_ref: reference policy (GPT instance, parameters should be frozen/eval)
             kl_beta: scalar coefficient for KL penalty
-            loss_mask: not used here (kept for API compatibility)
+            behavior_log_probs: optional iterable of floats (log prob of each full sequence under behavior policy)
+            use_is: bool, whether to enable importance sampling correction (requires behavior_log_probs)
         Returns:
             loss (torch.Tensor) that can be backpropagated, plus diagnostics (policy_loss, kl_div)
         """
+        
         device = next(self.parameters()).device
-        group_size = len(group_sequences)
-        if group_size == 0:
-            raise ValueError("group_sequences must be non-empty")
 
-        # to tensor on correct device
-        group_rewards = torch.tensor(group_rewards, dtype=torch.float32, device=device)
-        advantages = group_rewards - group_rewards.mean()
+        # compute advantages per sequence and flatten into a single vector
+        group_advantages = []
+        _rewards = []
+        for rewards in group_rewards:
+            rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+            advantages = rewards - rewards.mean()
+            group_advantages.append(advantages)
+            _rewards.append(rewards[:])
+        group_advantages = torch.stack(group_advantages).flatten()
+        _rewards = torch.stack(_rewards).flatten()
+        advantages = group_advantages.to(device)
 
-        policy_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
-        kl_divergence = torch.tensor(0.0, dtype=torch.float32, device=device)
+        # Pad sequences and create masks
+        input_ids_batch = group_sequences.view(-1, group_sequences.size(-1)).long().to(device)  # (B, G ,T) -> (B*G, T)   
+        targets_batch = group_targets.view(-1, group_targets.size(-1)).long().to(device)      # (B, G, T) -> (B*G, T)
+        attention_masks = group_masks.view(-1, group_masks.size(-1)).float().to(device)  # (B, G, T) -> (B*G, T)
 
-        # Process each sequence independently (handles variable lengths)
-        for i, seq in enumerate(group_sequences):
-            seq = list(seq)
-            if len(seq) < 2:
-                continue  # nothing to do for sequences of length < 2
+        BG, T = input_ids_batch.shape
+        freqs_cis = self.freqs_cis.to(device)[:T]
 
-            input_ids = torch.tensor([seq[:-1]], dtype=torch.long, device=device)   # shape (1, T)
-            targets = torch.tensor([seq[1:]], dtype=torch.long, device=device)      # shape (1, T)
-            T = input_ids.size(1)
+        # Forward pass through current policy
+        x = self.transformer.wte(input_ids_batch)
+        x = self.transformer.drop(x)
+        for block in self.transformer.h:
+            x = block(x, freqs_cis)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)  # (B, T, V)
 
-            # slice rotary freqs to sequence length
-            freqs_cis = self.freqs_cis.to(device)[:T]
+        # Compute log probabilities and gather token log-probs
+        log_probs = F.log_softmax(logits, dim=-1)  # (B, T, V)
+        tok_log_probs = log_probs.gather(-1, targets_batch.unsqueeze(-1)).squeeze(-1)  # (B, T)
+        tok_log_probs = tok_log_probs * attention_masks
+        seq_log_probs = tok_log_probs.sum(dim=1)  # (B,)
 
-            # forward current policy to get logits (1, T, V)
-            x = self.transformer.wte(input_ids)
-            x = self.transformer.drop(x)
-            for block in self.transformer.h:
-                x = block(x, freqs_cis)
-            x = self.transformer.ln_f(x)
-            logits = self.lm_head(x)
+        policy_losses = -advantages * seq_log_probs
 
-            # log probs and per-token log-prob for the taken actions
-            log_probs = F.log_softmax(logits, dim=-1)           # (1, T, V)
-            tok_log_probs = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)  # (1, T)
-            seq_logprob = tok_log_probs.sum()                   # scalar
+        policy_loss = policy_losses.mean()
 
-            # accumulate policy loss (weighted by advantage)
-            adv = advantages[i].to(device)
-            policy_loss = policy_loss + (-adv * seq_logprob)
+        loss = policy_loss
+        rewards = _rewards.mean()
+        acc = advantages.ge(0).float().sum()
 
-            # compute KL(pi || pi_ref) per-token and sum across tokens
-            with torch.no_grad():
-                # reference logits under actor_ref
-                xr = actor_ref.transformer.wte(input_ids)
-                xr = actor_ref.transformer.drop(xr)
-                for block in actor_ref.transformer.h:
-                    xr = block(xr, freqs_cis)
-                xr = actor_ref.transformer.ln_f(xr)
-                ref_logits = actor_ref.lm_head(xr)
-                ref_log_probs = F.log_softmax(ref_logits, dim=-1)
-
-            cur_probs = F.softmax(logits, dim=-1)               # (1, T, V)
-            kl_per_token = (cur_probs * (log_probs - ref_log_probs)).sum(dim=-1)  # (1, T)
-            kl_seq = kl_per_token.sum()
-            kl_divergence = kl_divergence + kl_seq
-
-        # average over group
-        policy_loss = policy_loss / group_size
-        kl_divergence = kl_divergence / group_size
-
-        loss = policy_loss + kl_beta * kl_divergence
-
-        return loss, policy_loss.detach(), kl_divergence.detach()
+        return loss, rewards, acc
 
     def forward_offline_grpo(self, group_sequences, group_targets, group_masks, group_rewards, actor_ref, kl_beta, behavior_log_probs=None, use_is=False, debug=False):
         """
@@ -628,7 +612,6 @@ class GPT(nn.Module):
 
             batch_eos = batch_eos | (idx_next.view(-1) == 1) # if sampled the <EOS> token
             if torch.all(batch_eos): # if all in the batch have finished, stop here
-                batch_finished = True
                 break
 
         return idx

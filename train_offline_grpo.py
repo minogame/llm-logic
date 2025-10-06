@@ -30,7 +30,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model_rope import GPTConfig, GPT
 
-exp_name = 'rope_l1_offline_grpo_345_b'
+exp_name = 'rope_l1_offline_grpo_345_c'
 # open log file in append mode so existing logs are preserved; we'll write a run timestamp header once per run
 log_file = open(f'train_log/{exp_name}.log', 'a')
 import sys
@@ -60,10 +60,10 @@ log = logger
 # I/O
 out_dir = 'out'
 ckpt_path = os.path.join(out_dir, 'ckpt_rope_l1_init_345_loss_mask_400.pt')
-eval_interval = 100
-save_interval = 1000
+eval_interval = 20
+save_interval = 20
 log_interval = 1
-eval_iters = 50
+eval_iters = 10000 // 64
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 # data
@@ -79,16 +79,16 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-6 # max learning rate
-max_iters = 2000 # total number of training iterations
+max_iters = 20 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
-kl_beta = 0.1 # weight of kl divergence loss
+kl_beta = 0 # weight of kl divergence loss
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 200 # how many steps to warm up for
-lr_decay_iters = 2000 # should be ~= max_iters per Chinchilla
+warmup_iters = 100 # how many steps to warm up for
+lr_decay_iters = 1000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-7 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -402,23 +402,20 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process and False:
-        losses = estimate_loss()
-        logger(f"step {iter_num}: train_ori loss {losses['train_ori']:.4f}, val loss {losses['val']:.4f}")
+    if iter_num > 0 and iter_num % eval_interval == 0 and master_process:
+        # losses = estimate_loss()
+        # logger(f"step {iter_num}: train_ori loss {losses['train_ori']:.4f}, val loss {losses['val']:.4f}")
 
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(), 'optimizer': optimizer.state_dict(),
-                    'model_args': model_args, 'iter_num': iter_num,
-                    'best_val_loss': best_val_loss, 'config': config,
-                }
-                if (iter_num) % save_interval == 0:
-                    logger(f"saving checkpoint to {out_dir}")
-                    torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{exp_name}_{iter_num}.pt'))
+        checkpoint = {
+            'model': raw_model.state_dict(), 'optimizer': optimizer.state_dict(),
+            'model_args': model_args, 'iter_num': iter_num,
+            'best_val_loss': best_val_loss, 'config': config,
+        }
+        if (iter_num) % save_interval == 0:
+            logger(f"saving checkpoint to {out_dir}")
+            torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{exp_name}_{iter_num}.pt'))
 
-                del checkpoint 
+        del checkpoint 
 
     if iter_num == 0 and eval_only: break
 
