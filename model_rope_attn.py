@@ -93,6 +93,27 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
+        # hook-related attributes (added)
+        self.last_attn = None            # will store the last attention tensor (detached)
+        self.attn_hooks = []            # list of callables: fn(att_tensor) where att_tensor is detached
+
+    def register_attn_hook(self, hook):
+        """
+        Register a hook callable that will be called with the attention matrix
+        (detached tensor) every forward pass. Hook signature: hook(att) where
+        att shape is (B, nh, T, T) on the same device as the model.
+
+        Returns:
+            None
+        """
+        if not callable(hook):
+            raise TypeError("hook must be callable")
+        self.attn_hooks.append(hook)
+
+    def clear_attn_hooks(self):
+        """Remove all registered attention hooks."""
+        self.attn_hooks.clear()
+
     def forward(self, x, freqs_cis):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
@@ -105,18 +126,37 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_embeddings(q, freqs_cis)
         k = apply_rotary_embeddings(k, freqs_cis)
 
-
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # if self.flash:
+        #     # efficient attention using Flash Attention CUDA kernels
+        #     y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        # else:
+        # manual implementation of attention
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+
+        # apply dropout to attention weights
+        att = self.attn_dropout(att)
+
+        # --- hook: store and call hooks with a detached tensor to avoid keeping computational graph ---
+        try:
+            att_to_send = att.detach()
+        except Exception:
+            att_to_send = att.clone().detach()
+        self.last_attn = att_to_send  # (B, nh, T, T), detached
+
+        # call user hooks (safely)
+        for hook in list(self.attn_hooks):
+            try:
+                hook(att_to_send)
+            except Exception:
+                # swallow exceptions from hooks so they don't break training
+                pass
+
+        # continue forward
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection

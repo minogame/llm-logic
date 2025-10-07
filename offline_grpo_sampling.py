@@ -1,5 +1,5 @@
 import os
-# os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # specify which GPUs to use, e.g. '0,1' for two GPUs
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'  # specify which GPUs to use, e.g. '0,1' for two GPUs
 import pickle
 from contextlib import nullcontext
 import torch
@@ -8,8 +8,8 @@ import tiktoken
 from model_rope import GPTConfig, GPT
 from data_generator_bool import BoolLogic as Dataset, BoolLogicTokenizer as Tokenizer
 
-model_name = 'ckpt_rope_l1_init_345_loss_mask_400.pt'
-model_name = 'ckpt_rope_l1_offline_grpo_345_c_20.pt'
+# model_name = 'ckpt_rope_l1_init_345_loss_mask_400.pt'
+model_name = 'ckpt_rope_l1_grpo_345_e_1320.pt'
 dataset_sampling_id = 0 # which dataset to use for sampling, from 0 to 99
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume'

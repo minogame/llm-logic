@@ -30,24 +30,42 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model_rope import GPTConfig, GPT
 
-exp_name = 'rope_l1_init_345_loss_mask_10'
-log_file = open(f'train_log/{exp_name}.log', 'w')
+# open log file in append mode so existing logs are preserved; we'll write a run timestamp header once per run
+exp_name = 'rope_l1_init_345_loss_mask_10_version2'
+log_file = open(f'train_log/{exp_name}.log', 'a')
+import sys
+from datetime import datetime
+
+# unified logger: write to both stdout and the log file
+def logger(msg='', end='\n', to_stdout=True, file=log_file):
+    text = str(msg)
+    if to_stdout:
+        sys.stdout.write(text + end)
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+    if file is not None:
+        try:
+            file.write(text + end)
+            file.flush()
+        except Exception:
+            pass
+
+# alias for convenience
+log = logger
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 100
-save_interval = 100
+eval_interval = 10
+save_interval = 10
 log_interval = 5
 eval_iters = 100
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
-# wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 8 # used to simulate larger batch sizes
@@ -61,7 +79,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 500 # total number of training iterations
+max_iters = 100 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -119,7 +137,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # poor man's data loader
 from data_generator_bool import BoolLogic as Dataset, BoolLogicTokenizer as Tokenizer
 tokenizer = Tokenizer()
-data_train = Dataset.load_dataset(filename='datasets/bool_logic_dataset_train_345_init.pkl') #
+data_train = Dataset.load_dataset(filename='datasets/bool_logic_dataset_train_345_init_version2.pkl') #
 data_val = data_train # Dataset.load_dataset(filename='datasets/bool_logic_dataset_val_d7_v1.pkl')
 data_train['offset'] = 0
 data_val['offset'] = 0
@@ -172,6 +190,36 @@ def get_batch(split):
         print(f"Resetting {split} dataset offset to 0")
 
     return x, y, loss_mask
+
+def test_generation(actor_model):
+    data = data_val
+    num_answers = 16
+    max_new_tokens = 512
+    temperature = 1.0
+    top_k = 10
+
+    expression_idx = data['offset']
+    prompt = data['expressions'][expression_idx][:]
+    start_ids = tokenizer.tokenize(prompt.split(Dataset.IMPLIES)[0] + Dataset.IMPLIES)
+    x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+
+    # duplicate x to have batch size of num_answers
+    x = x.repeat(num_answers, 1)
+    y = actor_model.batch_generate(x, max_new_tokens, temperature=temperature, top_k=top_k).detach().cpu().numpy()
+
+    sampled_exprs = tuple([ tokenizer.detokenize(y[i].tolist()).split('E')[0] for i in range(num_answers) ])
+
+    if master_process:
+        logger(f"Generating samples for expression {expression_idx}: \n{prompt.split(Dataset.IMPLIES)[0] + Dataset.IMPLIES} -> \n", to_stdout=False)
+        for expr in sampled_exprs:
+            logger(f"    {expr}", to_stdout=False)
+        logger("", to_stdout=False)
+
+    data['offset'] += 1
+    if data['offset'] + 1 > len(data['tokenized_expressions']):
+        # reset the offset to 0, so we can loop over the dataset
+        data['offset'] = 0
+
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -290,11 +338,6 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
-# logging
-if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
-
 # training loop
 X, Y, loss_mask = get_batch('train') # fetch the very first batch
 t0 = time.time()
@@ -310,36 +353,21 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        log_file.write(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        log_file.write("\n")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                if (iter_num) % save_interval == 0:
-                    print(f"saving checkpoint to {out_dir}")
-                    log_file.write(f"saving checkpoint to {out_dir}")
-                    log_file.write("\n")
-                    torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{exp_name}_{iter_num}.pt'))
+        test_generation(model)
 
-                del checkpoint 
+        checkpoint = {
+            'model': raw_model.state_dict(), 'optimizer': optimizer.state_dict(),
+            'model_args': model_args, 'iter_num': iter_num,
+            'best_val_loss': best_val_loss, 'config': config,
+        }
+
+        if (iter_num) % save_interval == 0:
+            print(f"saving checkpoint to {out_dir}")
+            log_file.write(f"saving checkpoint to {out_dir}")
+            log_file.write("\n")
+            torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{exp_name}_{iter_num}.pt'))
+
+        del checkpoint 
 
     if iter_num == 0 and eval_only:
         break

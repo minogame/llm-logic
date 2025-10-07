@@ -22,6 +22,34 @@ class BoolLogicTokenizer:
             '2': 13,
             '3': 14,
             '4': 15,
+            '5': 16,
+            '6': 17,
+            '7': 18,
+            '8': 19,
+            '9': 20,
+            'A': 21,  # Additional variables
+            'B': 22,
+            'C': 23,
+            'D': 24,
+            'O': 25,
+            'P': 26,
+            'Q': 27,
+            'L': 28,
+            'M': 29,
+            'N': 30,
+            'X': 31,
+            'Y': 32,
+            'Z': 33,
+            'U': 34,
+            'V': 35,
+            'W': 36,
+            'I': 37,
+            'J': 38,
+            'K': 39,
+            'H': 40,
+            'G': 41,
+            'R': 42,
+            'S': 43,
         }
         self.reverse_tokens = {v: k for k, v in self.tokens.items()}
         self.vocab_size = len(self.tokens)
@@ -191,7 +219,7 @@ class BoolLogic:
         _expr = expr.split(BoolLogic.IMPLIES)[0]
         ans = expr.split(BoolLogic.IMPLIES)[-1]
 
-        all_tokens = list(range(2, 16))
+        all_tokens = list(range(11, 11+32))
         gen_length = max_len - len(_expr) - 4
 
         rand_len = min(gen_length, np.random.randint(len(_expr)*0.5, len(_expr)*2))
@@ -236,7 +264,7 @@ class BoolLogic:
             score -= 0.5
 
         if label == label_:
-            score += 1.5
+            score += 1.6
         else:
             if label == '→T' or label == '→F':
                 score -= 0.5
@@ -336,11 +364,11 @@ if __name__ == "__main__":
 
     # BoolLogic.generate_mixed_dataset_and_save(num_samples=2000000, depth=[3,4,5,6], verbose=[1,2,3], filename='bool_logic_dataset_train_mixed_x6.pkl')
 
-    # BoolLogic.generate_init_expressions_and_save(num_samples=1000000, filename='bool_logic_dataset_train_345_init.pkl')
+    BoolLogic.generate_init_expressions_and_save(num_samples=300000, filename='bool_logic_dataset_train_345_init_version2.pkl')
     # for idx in range(100):
     #     print(f"{idx}", end=' ', flush=True)
     #     BoolLogic.generate_init_expressions_and_save(num_samples=10000, filename=f'datasets_sampling_b/bool_logic_dataset_train_345_grpo_sampling_{idx}.pkl')
-    BoolLogic.generate_init_expressions_and_save(num_samples=10000000, filename=f'datasets_sampling_b/bool_logic_dataset_train_345_grpo_sampling.pkl')
+    # BoolLogic.generate_init_expressions_and_save(num_samples=10000000, filename=f'datasets_sampling_b/bool_logic_dataset_train_345_grpo_sampling.pkl')
     # BoolLogic.generate_dataset_and_save(num_samples=1000000, depth=3, verbose=1, filename='bool_logic_dataset_train.pkl')
     # BoolLogic.generate_dataset_and_save(num_samples=10000, depth=8, verbose=1, filename='bool_logic_dataset_val_d8_v1.pkl')
     # BoolLogic.generate_dataset_and_save(num_samples=1000, depth=9, verbose=1, filename='bool_logic_dataset_val_d9_v1.pkl')

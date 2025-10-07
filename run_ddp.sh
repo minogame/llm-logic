@@ -4,10 +4,10 @@
 # 使用torchrun启动分布式训练
 
 # 设置环境变量 - 这里指定物理GPU设备
-export CUDA_VISIBLE_DEVICES=3,2 # 指定要使用的GPU
+export CUDA_VISIBLE_DEVICES=3,2,1 # 指定要使用的GPU
 
 # 单机多卡训练
-torchrun --nproc_per_node=2 \
+torchrun --nproc_per_node=3 \
          --master_port=29500 \
          train_grpo.py
 

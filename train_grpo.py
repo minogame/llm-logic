@@ -30,8 +30,9 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model_rope import GPTConfig, GPT
 from data_generator_bool import BoolLogic, BoolLogicTokenizer
+from scipy.stats import norm
 
-exp_name = 'rope_l1_grpo_345_d'
+exp_name = 'rope_l1_grpo_345_version2_a'
 # open log file in append mode so existing logs are preserved; we'll write a run timestamp header once per run
 log_file = open(f'train_log/{exp_name}.log', 'a')
 import sys
@@ -60,21 +61,21 @@ log = logger
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-ckpt_path = os.path.join(out_dir, 'ckpt_rope_l1_init_345_loss_mask_400.pt')
-eval_interval = 20
-save_interval = 20
+ckpt_path = os.path.join(out_dir, 'ckpt_rope_l1_init_345_loss_mask_10_version2_100.pt')
+eval_interval = 50
+save_interval = 50
 log_interval = 1
 eval_iters = 10000 // 64
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 8 # used to simulate larger batch sizes
-batch_size = 32 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 12 # used to simulate larger batch sizes
+batch_size = 24 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1536
-num_answers = 8
+num_answers = 16
 max_new_tokens = 512
-temperature = 1.2 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
+temperature = 1.0 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
 top_k = 10 # retain only the top_k most likely tokens, clamp others to have 0 probability
 # model
 n_layer = 1
@@ -83,18 +84,18 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 6e-6 # max learning rate
-max_iters = 2000 # total number of training iterations
+learning_rate = 6e-7 # max learning rate
+max_iters = 5000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+grad_clip = 0.1 # clip gradients at this value, or disable if == 0.0
 kl_beta = 0 # weight of kl divergence loss
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 100 # how many steps to warm up for
-lr_decay_iters = 2000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-7 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+warmup_iters = 0 # how many steps to warm up for
+lr_decay_iters = 5000 # should be ~= max_iters per Chinchilla
+min_lr = 6e-8 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -143,7 +144,7 @@ logger(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(133777 + seed_offset)
+torch.manual_seed(13377 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -156,6 +157,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # poor man's data loader
 from data_generator_bool import BoolLogic as Dataset, BoolLogicTokenizer as Tokenizer
 tokenizer = Tokenizer()
+# data_train = Dataset.load_dataset(filename='datasets_sampling_b/bool_logic_dataset_train_345_grpo_sampling.pkl') #
 data_train = Dataset.load_dataset(filename='datasets_sampling/bool_logic_dataset_train_345_grpo_sampling_merged.pkl') #
 data_val = Dataset.load_dataset(filename='datasets/bool_logic_dataset_val_d7_v1.pkl')
 data_train['offset'] = 0
@@ -239,7 +241,7 @@ def get_batch_train_ori():
 
     return x, y, loss_mask
 
-def get_batch_train(actor_model):
+def get_batch_train(actor_model, micro_step=0):
     data = data_train
 
     x_to_stack = []
@@ -260,10 +262,12 @@ def get_batch_train(actor_model):
 
         sampled_exprs = tuple([ tokenizer.detokenize(y[i].tolist()).split('E')[0] for i in range(num_answers) ])
 
-        if master_process and idx % batch_size == 0:
+        if master_process and micro_step == 0 and idx % batch_size == 0:
             logger(f"Generating samples for expression {expression_idx}: \n{prompt.split(Dataset.IMPLIES)[0] + Dataset.IMPLIES} -> \n", to_stdout=False)
             for expr in sampled_exprs:
                 logger(f"    {expr}", to_stdout=False)
+            logger("", to_stdout=False)
+            logger(f"    sample diversity: {[len(set(expr)) for expr in sampled_exprs]}", to_stdout=False)
             logger("", to_stdout=False)
 
         tokenized_sampled_expressions = tuple([ tokenizer.tokenize(expr) for expr in sampled_exprs ])
@@ -282,7 +286,7 @@ def get_batch_train(actor_model):
             target = expr[1:] + [tokenizer.tokens[' ']]  # shift by one for target
 
             mask =  [0] * first_implies + \
-                    [1] * (len(expr) - first_implies - 4) + \
+                    [0.5] * (len(expr) - first_implies - 4) + \
                     [1] * 3 + \
                     [0] * (block_size - len(expr) + 1)
             
@@ -309,10 +313,10 @@ def get_batch_train(actor_model):
     return x_to_stack, y_to_stack, mask_to_stack, score_to_stack
 
 
-def get_batch(split, actor_model):
+def get_batch(split, actor_model, micro_step=0):
 
     if split == 'train':
-        return get_batch_train(actor_model)
+        return get_batch_train(actor_model, micro_step=micro_step)
     elif split == 'val':
         return get_batch_val()
     elif split == 'train_ori':
@@ -414,23 +418,20 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process and False:
-        losses = estimate_loss()
-        logger(f"step {iter_num}: train_ori loss {losses['train_ori']:.4f}, val loss {losses['val']:.4f}")
+    if iter_num > 0 and iter_num % eval_interval == 0 and master_process:
+        # losses = estimate_loss()
+        # logger(f"step {iter_num}: train_ori loss {losses['train_ori']:.4f}, val loss {losses['val']:.4f}")
 
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(), 'optimizer': optimizer.state_dict(),
-                    'model_args': model_args, 'iter_num': iter_num,
-                    'best_val_loss': best_val_loss, 'config': config,
-                }
-                if (iter_num) % save_interval == 0:
-                    logger(f"saving checkpoint to {out_dir}")
-                    torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{exp_name}_{iter_num}.pt'))
+        checkpoint = {
+            'model': raw_model.state_dict(), 'optimizer': optimizer.state_dict(),
+            'model_args': model_args, 'iter_num': iter_num,
+            'best_val_loss': best_val_loss, 'config': config,
+        }
+        if (iter_num) % save_interval == 0:
+            logger(f"saving checkpoint to {out_dir}")
+            torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{exp_name}_{iter_num}.pt'))
+            del checkpoint 
 
-                del checkpoint 
 
     if iter_num == 0 and eval_only: break
 
@@ -448,7 +449,7 @@ while True:
             loss, policy_loss, kl_divergence = model(X, Y, masks, group_rewards=scores, mode='grpo')
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y, masks, scores = get_batch('train', actor)
+        X, Y, masks, scores = get_batch('train', actor, micro_step)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
@@ -470,8 +471,8 @@ while True:
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
         if isinstance(policy_loss, torch.Tensor):
-            policy_lossf = policy_loss.item() * gradient_accumulation_steps
-            kl_divf = kl_divergence.item() * gradient_accumulation_steps
+            policy_lossf = policy_loss.item()
+            kl_divf = kl_divergence.item()
         else:
             policy_lossf = 0.0
             kl_divf = 0.0
@@ -480,7 +481,14 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
 
-        logger(f"iter {iter_num}: loss {lossf:.4f}, rewards {policy_lossf:.4f}, acc {kl_divf / batch_size / num_answers / gradient_accumulation_steps:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        mu = batch_size*num_answers * 0.5
+        sigma = math.sqrt(batch_size*num_answers*0.25)
+        x_corrected = kl_divf - 0.5
+        z_score = (x_corrected - mu) / sigma
+        p_value = norm.sf(z_score)
+
+        acc = kl_divf / batch_size / num_answers
+        logger(f"iter {iter_num}: loss {lossf:.4f}, rewards {policy_lossf:.4f}, acc {acc:.4f}, p_value {p_value:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 
