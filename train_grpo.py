@@ -32,7 +32,7 @@ from model_rope import GPTConfig, GPT
 from data_generator_bool import BoolLogic, BoolLogicTokenizer
 from scipy.stats import norm
 
-exp_name = 'rope_l1_grpo_345_version2_a'
+exp_name = 'rope_l1_grpo_345_version2_c'
 # open log file in append mode so existing logs are preserved; we'll write a run timestamp header once per run
 log_file = open(f'train_log/{exp_name}.log', 'a')
 import sys
@@ -84,7 +84,7 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 6e-7 # max learning rate
+learning_rate = 6e-6 # max learning rate
 max_iters = 5000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -95,7 +95,7 @@ kl_beta = 0 # weight of kl divergence loss
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 0 # how many steps to warm up for
 lr_decay_iters = 5000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-8 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+min_lr = 6e-7 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -272,10 +272,11 @@ def get_batch_train(actor_model, micro_step=0):
 
         tokenized_sampled_expressions = tuple([ tokenizer.tokenize(expr) for expr in sampled_exprs ])
         score = tuple([ Dataset.evaluate_expression(expr, data['expressions'][expression_idx]) for expr in sampled_exprs ])
+        format_score = tuple([ Dataset.evaluate_expression(expr, data['expressions'][expression_idx], version=1) for expr in sampled_exprs ])
         first_implies = y[0].tolist().index(tokenizer.tokens[BoolLogic.IMPLIES])
 
         exprs, targets, masks = [], [], []
-        for expr in tokenized_sampled_expressions:
+        for expr_idx, expr in enumerate(tokenized_sampled_expressions):
             if len(expr) > block_size:
                 # truncate the expression to fit into the block size
                 expr = expr[-block_size:]
@@ -285,11 +286,25 @@ def get_batch_train(actor_model, micro_step=0):
 
             target = expr[1:] + [tokenizer.tokens[' ']]  # shift by one for target
 
-            mask =  [0] * first_implies + \
-                    [0.5] * (len(expr) - first_implies - 4) + \
-                    [1] * 3 + \
-                    [0] * (block_size - len(expr) + 1)
-            
+            if format_score[expr_idx] > 0:
+                # high reward for correct and well formatted expressions
+                mask =  [0] * first_implies + \
+                        [0.9] * (len(expr) - first_implies - 4) + \
+                        [1] * 3 + \
+                        [0] * (block_size - len(expr) + 1)
+            elif format_score[expr_idx] < 0 and format_score[expr_idx] > -0.75:
+                # medium reward for incorrect but well formatted expressions
+                mask =  [0] * first_implies + \
+                        [0.4] * (len(expr) - first_implies - 4) + \
+                        [0, 0.4, 0] + \
+                        [0] * (block_size - len(expr) + 1)
+            else:
+                # low reward for poorly formatted expressions
+                mask =  [0] * first_implies + \
+                        [0.1] * (len(expr) - first_implies - 4) + \
+                        [0.5] * 3 + \
+                        [0] * (block_size - len(expr) + 1)
+                
             mask = mask[:block_size]  # make sure loss_mask is of length block_size
 
             exprs.append(torch.from_numpy(np.array(expr, dtype=np.int64)))
@@ -470,12 +485,30 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+
         if isinstance(policy_loss, torch.Tensor):
-            policy_lossf = policy_loss.item()
-            kl_divf = kl_divergence.item()
+            policy_loss_raw = float(policy_loss.item())
+            kl_div_raw = float(kl_divergence.item())
         else:
-            policy_lossf = 0.0
-            kl_divf = 0.0
+            policy_loss_raw = 0.0
+            kl_div_raw = 0.0
+
+        # initialize EMA accumulators on first use
+        if 'ema_policy_loss' not in globals() or ema_policy_loss is None:
+            ema_policy_loss = policy_loss_raw
+        if 'ema_kl_div' not in globals() or ema_kl_div is None:
+            ema_kl_div = kl_div_raw
+
+        # EMA smoothing factor (alpha): higher -> more weight to recent values
+        ema_alpha = 0.1
+
+        # update exponential moving averages
+        ema_policy_loss = ema_alpha * policy_loss_raw + (1.0 - ema_alpha) * ema_policy_loss
+        ema_kl_div = ema_alpha * kl_div_raw + (1.0 - ema_alpha) * ema_kl_div
+
+        # use EMA values for logging / downstream computations
+        policy_lossf = ema_policy_loss
+        kl_divf = ema_kl_div
 
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)

@@ -243,7 +243,7 @@ class GPT(nn.Module):
         _rewards = []
         for rewards in group_rewards:
             rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
-            advantages = rewards - rewards.mean()
+            advantages = rewards - 0.5 #rewards.mean()
             group_advantages.append(advantages)
             _rewards.append(rewards[:])
         group_advantages = torch.stack(group_advantages).flatten()

@@ -5,8 +5,11 @@ from contextlib import nullcontext
 import torch
 import time
 import tiktoken
-from model_rope import GPTConfig, GPT
+from model_rope_attn import GPTConfig, GPT
 from data_generator_bool import BoolLogic as Dataset, BoolLogicTokenizer as Tokenizer
+import math
+import numpy as np
+import matplotlib.pyplot as plt
 
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume'
@@ -29,7 +32,8 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-model_name = 'ckpt_rope_l1_grpo_345_version2_a_100.pt'
+model_name = 'ckpt_rope_l1_grpo_345_version2_b_2600.pt'
+# model_name = 'ckpt_rope_l1_mixed_x6_1000.pt'
 # init from a model saved in a specific directory
 ckpt_path = os.path.join(out_dir, model_name)
 checkpoint = torch.load(ckpt_path, map_location=device)
@@ -40,7 +44,7 @@ unwanted_prefix = '_orig_mod.'
 for k,v in list(state_dict.items()):
     if k.startswith(unwanted_prefix):
         state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-model.load_state_dict(state_dict)
+model.load_state_dict(state_dict, strict=False)
 
 model.eval()
 model.to(device)
@@ -85,7 +89,7 @@ tokenizer = Tokenizer()
 dataset_val = 'bool_logic_dataset_val_d4_v1.pkl'
 data_val = Dataset.load_dataset(filename=f'datasets/{dataset_val}')
 
-outfile = open(f'analysis_a_{model_name}_on_{dataset_val}_samples_{num_samples}.txt', 'w')
+outfile = open(f'analysis/analysis_a_{model_name}_on_{dataset_val}_samples_{num_samples}.txt', 'w')
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
@@ -101,6 +105,40 @@ with torch.no_grad():
             outfile.write(f"Detokenized outputs: {output}\n")
 
             outfile.write('---------------\n')
+
+def plot_attention_heatmap(last_att, out_png):
+
+    att_np = last_att.numpy() if not isinstance(last_att, np.ndarray) else last_att
+    B, nh, T, _ = att_np.shape
+
+    # choose batch 0 for plotting
+    att_batch = att_np[0]
+
+    ncols = min(4, nh)
+    nrows = math.ceil(nh / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 2.5, nrows * 2.2))
+    axes = np.array(axes).reshape(-1)
+
+    vmax = float(att_batch.max())
+    vmin = float(att_batch.min())
+
+    for h in range(nh):
+        ax = axes[h]
+        im = ax.imshow(att_batch[h], cmap='viridis', vmin=vmin, vmax=vmax, aspect='auto')
+        ax.set_title(f"head {h}", fontsize=8)
+        ax.set_xlabel("key")
+        ax.set_ylabel("query")
+        ax.tick_params(axis='both', which='major', labelsize=6)
+        # small colorbar per head (optional)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+
+    # hide any unused subplots
+    for j in range(nh, axes.size):
+        axes[j].axis('off')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
 
 # 清空本次 sample 的 attention 记录
 for lst in attn_records.values():
@@ -127,6 +165,9 @@ for layer_idx, recs in attn_records.items():
         last_att = recs[-1]  # Tensor on CPU
         outfile.write(f"Layer {layer_idx}: records={len(recs)}, last_shape={tuple(last_att.shape)}, last_mean={float(last_att.mean()):.6f}\n")
 
+        
+out_png = f"analysis/analysis_a_{model_name}_on_{dataset_val}_layer_{layer_idx}_heads.png"
+plot_attention_heatmap(last_att, out_png)
 
 outfile.close()
 
