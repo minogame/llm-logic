@@ -17,7 +17,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'  # specify which GPUs to use, e.g. '0,1' for two GPUs
+# os.environ['CUDA_VISIBLE_DEVICES'] = '1'  # specify which GPUs to use, e.g. '0,1' for two GPUs
 import time
 import math
 import pickle
@@ -31,7 +31,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from model_rope import GPTConfig, GPT
 
 # open log file in append mode so existing logs are preserved; we'll write a run timestamp header once per run
-exp_name = 'rope_l1_init_345_loss_mask_10_version2'
+exp_name = 'rope_l2_causal_3_for_ood'
 log_file = open(f'train_log/{exp_name}.log', 'a')
 import sys
 from datetime import datetime
@@ -59,8 +59,8 @@ log = logger
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 10
-save_interval = 10
+eval_interval = 250
+save_interval = 250
 log_interval = 5
 eval_iters = 100
 eval_only = False # if True, script exits right after the first eval
@@ -72,14 +72,14 @@ gradient_accumulation_steps = 8 # used to simulate larger batch sizes
 batch_size = 60 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1536
 # model
-n_layer = 1
-n_head = 12
-n_embd = 768
+n_layer = 2
+n_head = 6
+n_embd = 384
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 100 # total number of training iterations
+max_iters = 1000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -87,7 +87,7 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 40 # how many steps to warm up for
-lr_decay_iters = 40000 # should be ~= max_iters per Chinchilla
+lr_decay_iters = 1000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -137,8 +137,8 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # poor man's data loader
 from data_generator_bool import BoolLogic as Dataset, BoolLogicTokenizer as Tokenizer
 tokenizer = Tokenizer()
-data_train = Dataset.load_dataset(filename='datasets/bool_logic_dataset_train_345_init_version2.pkl') #
-data_val = data_train # Dataset.load_dataset(filename='datasets/bool_logic_dataset_val_d7_v1.pkl')
+data_train = Dataset.load_dataset(filename='datasets/bool_logic_dataset_train.pkl') #
+data_val = Dataset.load_dataset(filename='datasets/bool_logic_dataset_val_d4_v1.pkl')
 data_train['offset'] = 0
 data_val['offset'] = 0
 
@@ -353,7 +353,7 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        test_generation(model)
+        # test_generation(model)
 
         checkpoint = {
             'model': raw_model.state_dict(), 'optimizer': optimizer.state_dict(),

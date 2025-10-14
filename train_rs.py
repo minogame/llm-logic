@@ -32,7 +32,7 @@ from model_rope import GPTConfig, GPT
 from data_generator_bool import BoolLogic, BoolLogicTokenizer
 from scipy.stats import norm
 
-exp_name = 'rope_l2_grpo_34_noimplies_b'
+exp_name = 'rope_l2_grpo_3_rs_version1_a'
 # open log file in append mode so existing logs are preserved; we'll write a run timestamp header once per run
 log_file = open(f'train_log/{exp_name}.log', 'a')
 import sys
@@ -61,7 +61,7 @@ log = logger
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-ckpt_path = os.path.join(out_dir, 'ckpt_rope_l2_init_34_noimplies_a_20.pt')
+ckpt_path = os.path.join(out_dir, 'ckpt_rope_l2_init_3_loss_mask_10_version1_20.pt')
 eval_interval = 50
 save_interval = 50
 log_interval = 1
@@ -71,12 +71,12 @@ always_save_checkpoint = True # if True, always save a checkpoint after each eva
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 12 # used to simulate larger batch sizes
-batch_size = 96 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 24 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1536
-num_answers = 4
+num_answers = 16
 max_new_tokens = 512
 temperature = 1.0 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
-top_k = 5 # retain only the top_k most likely tokens, clamp others to have 0 probability
+top_k = 10 # retain only the top_k most likely tokens, clamp others to have 0 probability
 # model
 n_layer = 2
 n_head = 6
@@ -90,7 +90,7 @@ max_iters = 5000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 0.4 # clip gradients at this value, or disable if == 0.0
+grad_clip = 0.1 # clip gradients at this value, or disable if == 0.0
 kl_beta = 0 # weight of kl divergence loss
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
@@ -145,7 +145,8 @@ logger(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(131377 + seed_offset)
+
+torch.manual_seed(int(time.time() * 1000) + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -158,9 +159,9 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # poor man's data loader
 from data_generator_bool import BoolLogic as Dataset, BoolLogicTokenizer as Tokenizer
 tokenizer = Tokenizer()
-data_train = Dataset.load_dataset(filename='datasets_sampling_b/bool_logic_dataset_train_34_grpo_for_sampling.pkl') #
+data_train = Dataset.load_dataset(filename='datasets/bool_logic_dataset_train.pkl') #
 # data_train = Dataset.load_dataset(filename='datasets_sampling/bool_logic_dataset_train_345_grpo_sampling_merged.pkl') #
-data_val = Dataset.load_dataset(filename='datasets/bool_logic_dataset_val_d7_v1.pkl')
+data_val = Dataset.load_dataset(filename='datasets/bool_logic_dataset_val_d6_v1.pkl')
 data_train['offset'] = 0
 data_val['offset'] = 0
 
@@ -205,7 +206,6 @@ def get_batch_val():
 
     return x, y, loss_mask
 
-
 def get_batch_train_ori():
     data = data_train
 
@@ -249,11 +249,13 @@ def get_batch_train(actor_model, micro_step=0):
     y_to_stack = []
     mask_to_stack = []
     score_to_stack = []
+    label_to_stack = []
 
     for idx in range(batch_size):
         expression_idx = data['offset'] + idx
 
         prompt = data['expressions'][expression_idx][:]
+        label = data['expressions'][expression_idx][-1]
         start_ids = tokenizer.tokenize(prompt.split(Dataset.IMPLIES)[0] + Dataset.IMPLIES)
         x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
@@ -262,18 +264,20 @@ def get_batch_train(actor_model, micro_step=0):
         y = actor_model.batch_generate(x, max_new_tokens, temperature=temperature, top_k=top_k).detach().cpu().numpy()
 
         sampled_exprs = tuple([ tokenizer.detokenize(y[i].tolist()).split('E')[0] for i in range(num_answers) ])
+        pos_sampled_exprs_answer = tuple([ (len(expr)-2, tokenizer.tokens[label]) for expr in sampled_exprs ])  # position of the answer (last character before 'E')
 
         if master_process and micro_step == 0 and idx % batch_size == 0:
             logger(f"Generating samples for expression {expression_idx}: \n{prompt.split(Dataset.IMPLIES)[0] + Dataset.IMPLIES} -> \n", to_stdout=False)
-            logger(f"  Target: \n {data['expressions'][expression_idx]} \n", to_stdout=False)
+            logger(f"    ground truth: {data['expressions'][expression_idx]}", to_stdout=False)
             for expr in sampled_exprs:
                 logger(f"    {expr}", to_stdout=False)
             logger("", to_stdout=False)
             logger(f"    sample diversity: {[len(set(expr)) for expr in sampled_exprs]}", to_stdout=False)
             logger("", to_stdout=False)
+            logger(f"    positions: {pos_sampled_exprs_answer}", to_stdout=False)
+            logger("", to_stdout=False)
 
-        score = tuple([ Dataset.evaluate_expression(expr, data['expressions'][expression_idx]) for expr in sampled_exprs ])
-        format_score = tuple([ Dataset.evaluate_expression(expr, data['expressions'][expression_idx], version=1) for expr in sampled_exprs ])
+        score = tuple([ Dataset.evaluate_expression(expr, data['expressions'][expression_idx], version=2) for expr in sampled_exprs ])
         first_implies = y[0].tolist().index(tokenizer.tokens[BoolLogic.IMPLIES])
         # add EOS
         sampled_exprs = tuple([ expr + 'E' if not expr.endswith('E') else expr for expr in sampled_exprs ])
@@ -290,25 +294,11 @@ def get_batch_train(actor_model, micro_step=0):
 
             target = expr[1:] + [tokenizer.tokens[' ']]  # shift by one for target
 
-            if format_score[expr_idx] > 0:
-                # high reward for correct and well formatted expressions
-                mask =  [0] * first_implies + \
-                        [0.9] * (len(expr) - first_implies - 4) + \
-                        [1] * 3 + \
-                        [0] * (block_size - len(expr) + 1)
-            elif format_score[expr_idx] < 0 and format_score[expr_idx] > -0.75:
-                # medium reward for incorrect but well formatted expressions
-                mask =  [0] * first_implies + \
-                        [0.4] * (len(expr) - first_implies - 4) + \
-                        [0, 0.4, 0] + \
-                        [0] * (block_size - len(expr) + 1)
-            else:
-                # low reward for poorly formatted expressions
-                mask =  [0] * first_implies + \
-                        [0.1] * (len(expr) - first_implies - 4) + \
-                        [0.5] * 3 + \
-                        [0] * (block_size - len(expr) + 1)
-                
+            mask =  [0] * first_implies + \
+                    [0.9] * (len(expr) - first_implies - 4) + \
+                    [1] * 3 + \
+                    [0] * (block_size - len(expr) + 1)
+            
             mask = mask[:block_size]  # make sure loss_mask is of length block_size
 
             exprs.append(torch.from_numpy(np.array(expr, dtype=np.int64)))
@@ -319,18 +309,19 @@ def get_batch_train(actor_model, micro_step=0):
         y_to_stack.append(torch.stack(targets))
         mask_to_stack.append(torch.stack(masks))
         score_to_stack.append(score)
+        label_to_stack.append(pos_sampled_exprs_answer)
 
     x_to_stack = torch.stack(x_to_stack) # (B, G, T)
     y_to_stack = torch.stack(y_to_stack) # (B, G, T)
     mask_to_stack = torch.stack(mask_to_stack) # (B, G, T)
+    label_to_stack = torch.tensor(label_to_stack, dtype=torch.long) # (B, G, 2)
 
     data['offset'] += batch_size
     if data['offset'] + batch_size > len(data['tokenized_expressions']):
         # reset the offset to 0, so we can loop over the dataset
         data['offset'] = 0
 
-    return x_to_stack, y_to_stack, mask_to_stack, score_to_stack
-
+    return x_to_stack, y_to_stack, mask_to_stack, score_to_stack, label_to_stack
 
 def get_batch(split, actor_model, micro_step=0):
 
@@ -422,7 +413,7 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 # training loop
-X, Y, masks, scores = get_batch('train', actor) # fetch the very first batch
+X, Y, masks, scores, label = get_batch('train', actor) # fetch the very first batch
 
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
@@ -465,10 +456,10 @@ while True:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             # group_sequences, group_rewards, actor_ref, kl_beta, behavior_log_probs=None, use_is=False
-            loss, policy_loss, kl_divergence = model(X, Y, masks, group_rewards=scores, mode='grpo')
+            loss, policy_loss, kl_divergence = model(X, Y, masks, group_rewards=scores, group_labels=label, mode='reject_sampling')
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y, masks, scores = get_batch('train', actor, micro_step)
+        X, Y, masks, scores, label = get_batch('train', actor, micro_step)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient

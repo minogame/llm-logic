@@ -87,6 +87,7 @@ class CausalSelfAttention(nn.Module):
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.attn_T = config.attn_T
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -109,7 +110,11 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            if self.attn_T:
+                q_scaled = q / self.attn_T
+                y = torch.nn.functional.scaled_dot_product_attention(q_scaled, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            else:
+                y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -162,6 +167,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    attn_T: float = False
 
 class GPT(nn.Module):
 
@@ -269,6 +275,7 @@ class GPT(nn.Module):
         # Compute log probabilities and gather token log-probs
         log_probs = F.log_softmax(logits, dim=-1)  # (B, T, V)
         tok_log_probs = log_probs.gather(-1, targets_batch.unsqueeze(-1)).squeeze(-1)  # (B, T)
+        # tok_log_probs[tok_log_probs < 0.03] = 0.0
         tok_log_probs = tok_log_probs * attention_masks
         seq_log_probs = tok_log_probs.sum(dim=1)  # (B,)
         seq_log_probs = seq_log_probs / attention_masks.sum(dim=1)  # normalize by sequence length
@@ -391,6 +398,74 @@ class GPT(nn.Module):
 
         return loss, policy_loss.detach(), kl_divergence.detach()
 
+    def forward_reject_sampling(self, group_sequences, group_targets, group_masks, group_rewards, group_labels):
+        """
+        Reject sampling style objective:
+            - policy loss = - E[ log pi(a_{1:T} | s) * I(a_{1:T} is accepted) ]
+
+        Args:
+            group_sequences: a batch of iterable of token id lists (each a generated sequence)
+            group_targets: a batch of iterable of token id lists (each the target tokens, shifted by 1)
+            group_mask: a batch of iterable of floats (1.0 for tokens to include in loss, 0.0 to ignore)
+            group_rewards: a batch iterable of floats (one reward per sequence)
+            group_labels: a batch iterable of bools (one label per sequence, whether accepted or not)
+        Returns:
+            loss (torch.Tensor) that can be backpropagated, plus diagnostics (policy_loss,)
+        """
+        device = next(self.parameters()).device
+
+        # Pad sequences and create masks
+        input_ids_batch = group_sequences.view(-1, group_sequences.size(-1)).long().to(device)  # (B, G ,T) -> (B*G, T)   
+        targets_batch = group_targets.view(-1, group_targets.size(-1)).long().to(device)      # (B, G, T) -> (B*G, T)
+        attention_masks = group_masks.view(-1, group_masks.size(-1)).float().to(device)  # (B, G, T) -> (B*G, T)
+        labels_batch = group_labels.to(device)  # (B, G, 2)
+
+        # for reference only
+        # compute advantages per sequence and flatten into a single vector
+        group_advantages = []
+        _rewards = []
+        for rewards in group_rewards:
+            rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+            advantages = rewards - 0.5 #rewards.mean()
+            group_advantages.append(advantages)
+            _rewards.append(rewards[:])
+        group_advantages = torch.stack(group_advantages).flatten()
+        _rewards = torch.stack(_rewards).flatten()
+        advantages = group_advantages.to(device)
+
+        B, G, T = group_sequences.shape
+        freqs_cis = self.freqs_cis.to(device)[:T]
+
+        # Forward pass through current policy
+        x = self.transformer.wte(input_ids_batch)
+        x = self.transformer.drop(x)
+        for block in self.transformer.h:
+            x = block(x, freqs_cis)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)  # (BG, T, V)
+
+        # for reference only
+        # Compute log probabilities and gather token log-probs
+        log_probs = F.log_softmax(logits, dim=-1)  # (BG, T, V)
+        tok_log_probs = log_probs.gather(-1, targets_batch.unsqueeze(-1)).squeeze(-1) * attention_masks  # (BG, T)
+        seq_log_probs = tok_log_probs.sum(dim=1).div(attention_masks.sum(dim=1))  # (BG,), normalize by sequence length
+        rewards = _rewards.mean().detach()
+        acc = _rewards.ge(0).sum().detach()
+
+        # Select the most confident accepted samples
+        log_probs = log_probs.view(group_sequences.size(0), group_sequences.size(1), logits.size(1), logits.size(2))  # (B, G, T, V)
+
+        # 假设 log_probs.shape = (B, G, T, V)
+        # labels_batch.shape = (B, G, 2)
+        b_indices = torch.arange(B, device=log_probs.device).view(B, 1)
+        g_indices = torch.arange(G, device=log_probs.device).view(1, G)
+        selected_idx = log_probs[b_indices, g_indices, labels_batch[:, :, 0], labels_batch[:, :, 1]].argmax(dim=-1)  # 输出形状: (B, G)
+        selected_seq_log_probs = seq_log_probs.view(B, G).gather(1, selected_idx.unsqueeze(1)).squeeze(1)  # 输出形状: (B,)
+        rs_loss = -selected_seq_log_probs.mean()
+
+        return rs_loss, rewards, acc
+
+
     def forward_pretrain(self, idx, targets=None, loss_mask=None):
         device = idx.device
         b, t = idx.size()
@@ -441,6 +516,8 @@ class GPT(nn.Module):
             return model.forward_grpo(*args, **kwargs)
         elif mode == 'offline_grpo':
             return model.forward_offline_grpo(*args, **kwargs)
+        elif mode == 'reject_sampling':
+            return model.forward_reject_sampling(*args, **kwargs)
         else:
             raise ValueError(f"Unknown mode: {mode}")
 

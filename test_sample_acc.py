@@ -29,7 +29,7 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-model_name = 'ckpt_rope_l1_init_345_loss_mask_400.pt'
+model_name = 'ckpt_rope_l2_causal_3_for_ood_1000.pt'
 # init from a model saved in a specific directory
 ckpt_path = os.path.join(out_dir, model_name)
 checkpoint = torch.load(ckpt_path, map_location=device)

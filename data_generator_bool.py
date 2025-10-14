@@ -222,12 +222,27 @@ class BoolLogic:
         all_tokens = list(range(11, 11+32))
         gen_length = max_len - len(_expr) - 4
 
-        rand_len = min(gen_length, np.random.randint(len(_expr)*0.5, len(_expr)*2))
+        rand_len = min(gen_length, np.random.randint(len(_expr)*0.3, len(_expr)*0.7))
         expr_ = tokenizer.detokenize([random.choice(all_tokens) for _ in range(rand_len)])
         expr = _expr + BoolLogic.IMPLIES + expr_ + BoolLogic.IMPLIES + ans
 
         return expr, 1
 
+
+    @staticmethod
+    def generate_init_expression_v2(expr, tokenizer, max_len=1536):
+        _expr = expr.split(BoolLogic.IMPLIES)[0]
+        ans = expr.split(BoolLogic.IMPLIES)[-1]
+
+        all_tokens = list(range(11, 11+32))
+        gen_length = max_len - len(_expr) - 4
+
+        rand_len = min(gen_length, np.random.randint(len(_expr)*0.3, len(_expr)*0.7))
+        expr_ = tokenizer.detokenize([random.choice(all_tokens) for _ in range(rand_len)])
+        expr = _expr + BoolLogic.IMPLIES + expr_ + BoolLogic.IFF + ans
+
+        return expr, 1
+    
     @staticmethod
     def evaluate_expression_1(expr, expr_):
 
@@ -274,11 +289,43 @@ class BoolLogic:
         return score
 
     @staticmethod
-    def evaluate_expression(expr, expr_, version=2):
+    def evaluate_expression_3(expr, expr_):
+
+        score = 0.0
+        label = expr[-2:] # ->T or ->F
+        # label_ = expr_[-2:] # ->T or ->F
+        label_ = '↔' + expr_[-1] # ↔T or ↔F
+
+        len_prompt = len(expr.split(BoolLogic.IMPLIES)[0])
+        len_sample = len(expr) - len_prompt
+        len_sample_ = len(expr_) - len_prompt
+
+        if len_sample < len_sample_ // 2:
+            score -= 0.5
+        if len_sample < len_sample_ // 4:
+            score -= 1.0
+        if len_sample > len_sample_ * 2:
+            score -= 0.5
+
+        if label == label_:
+            score += 1.6
+        else:
+            if label == '↔T' or label == '↔F':
+                score -= 0.5
+            else:
+                score -= 0.5
+            
+        return score
+    
+    
+    @staticmethod
+    def evaluate_expression(expr, expr_, version=3):
         if version == 1:
             score = BoolLogic.evaluate_expression_1(expr, expr_)
         elif version == 2:
             score = BoolLogic.evaluate_expression_2(expr, expr_)
+        elif version == 3:
+            score = BoolLogic.evaluate_expression_3(expr, expr_)
         else:
             raise NotImplementedError    
         
@@ -355,6 +402,43 @@ class BoolLogic:
         with open(filename, 'wb') as f:
             pickle.dump(dataset, f)
 
+
+    @staticmethod
+    def generate_init_expressions_and_save_noimplies(num_samples=1000000, depth=[3,4,5], filename='bool_logic_dataset.pkl'):
+        tokenizer = BoolLogicTokenizer()
+        tokenized_expressions = []
+        pos_implies = []
+
+        expressions = []
+
+        n_t = 0
+
+        while len(expressions) < num_samples:
+            d = random.choice(depth)
+            expr = BoolLogic.generate_expression(d, verbose = 999)
+            expr, n = BoolLogic.generate_init_expression_v2(expr, tokenizer)
+            expressions.append(expr),
+            n_t += n
+
+        print(f"Tokenizing expressions...")
+        for e in expressions:
+            tokenized_expression = tokenizer.tokenize(e)
+            tokenized_expression.append(tokenizer.tokens['E'])  # Append end token
+
+            tokenized_expressions.append(tokenized_expression)
+
+            first_implies = tokenized_expression.index(tokenizer.tokens[BoolLogic.IMPLIES])
+            pos_implies.append(first_implies)
+
+        dataset = dict()
+        dataset['expressions'] = expressions
+        dataset['tokenized_expressions'] = tokenized_expressions
+        dataset['pos_implies'] = pos_implies
+
+        with open(filename, 'wb') as f:
+            pickle.dump(dataset, f)
+
+
 if __name__ == "__main__":
     # # Example usage
     # expressions = BoolLogic.generate_expressions(num_samples=1000, depth=5, verbose=1)
@@ -362,9 +446,11 @@ if __name__ == "__main__":
     # for expr in expressions:
     #     print(expr)
 
-    # BoolLogic.generate_mixed_dataset_and_save(num_samples=2000000, depth=[3,4,5,6], verbose=[1,2,3], filename='bool_logic_dataset_train_mixed_x6.pkl')
+    # BoolLogic.generate_mixed_dataset_and_save(num_samples=1000000, 
+    #                                           depth=[3,4], verbose=[3], 
+    #                                           filename='datasets_sampling_b/bool_logic_dataset_train_34_grpo_for_sampling.pkl')
 
-    BoolLogic.generate_init_expressions_and_save(num_samples=300000, filename='bool_logic_dataset_train_345_init_version2.pkl')
+    BoolLogic.generate_init_expressions_and_save_noimplies(num_samples=100000, filename='datasets_sampling_b/bool_logic_dataset_train_34_init_version2.pkl')
     # for idx in range(100):
     #     print(f"{idx}", end=' ', flush=True)
     #     BoolLogic.generate_init_expressions_and_save(num_samples=10000, filename=f'datasets_sampling_b/bool_logic_dataset_train_345_grpo_sampling_{idx}.pkl')

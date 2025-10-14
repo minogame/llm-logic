@@ -114,7 +114,7 @@ class CausalSelfAttention(nn.Module):
         """Remove all registered attention hooks."""
         self.attn_hooks.clear()
 
-    def forward(self, x, freqs_cis):
+    def forward(self, x, freqs_cis, bias=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -133,7 +133,10 @@ class CausalSelfAttention(nn.Module):
         # else:
         # manual implementation of attention
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        if bias is None:
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        else:
+            att = att.masked_fill(bias[:,:,:T,:T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
 
         # apply dropout to attention weights
@@ -188,8 +191,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, freqs_cis):
-        x = x + self.attn(self.ln_1(x), freqs_cis)
+    def forward(self, x, freqs_cis, bias=None):
+        x = x + self.attn(self.ln_1(x), freqs_cis, bias=bias)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -201,6 +204,7 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
+    attn_T: float = False
     bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 class GPT(nn.Module):
@@ -431,15 +435,14 @@ class GPT(nn.Module):
 
         return loss, policy_loss.detach(), kl_divergence.detach()
 
-    def forward_pretrain(self, idx, targets=None, loss_mask=None):
+    def forward_pretrain(self, idx, targets=None, loss_mask=None, bias=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # Create one-hot encoding and set requires_grad=True
         one_hot = F.one_hot(idx, num_classes=self.config.vocab_size).float().to(device)
-        # one_hot.requires_grad_(True)
+        one_hot.requires_grad_(True)
         
         # forward the GPT model itself
         tok_emb = torch.matmul(one_hot, self.transformer.wte.weight) # token embeddings of shape (b, t, n_embd)
@@ -450,7 +453,7 @@ class GPT(nn.Module):
         freqs_cis = freqs_cis[:t]
 
         for block in self.transformer.h:
-            x = block(x, freqs_cis)
+            x = block(x, freqs_cis, bias=bias)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -461,7 +464,6 @@ class GPT(nn.Module):
                 loss = loss * loss_mask.view(-1)
 
             loss = loss.sum()
-
             # Compute gradients w.r.t. one_hot
             grads = None
             if one_hot.requires_grad:
@@ -474,16 +476,45 @@ class GPT(nn.Module):
 
         return logits, loss, grads
 
+    def forward_logits(self, idx, bias=None):
+        """
+        Forward pass that returns just the logits, useful for inference.
+        Args:
+            idx: (B, T) array of indices in the vocabulary
+        Returns:
+            logits: (B, T, C) array of logits for each token in the vocabulary
+        """
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+
+        # forward the GPT model itself
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        x = self.transformer.drop(x)
+
+        freqs_cis = self.freqs_cis.to(device)
+        freqs_cis = freqs_cis[:t]
+
+        for block in self.transformer.h:
+            x = block(x, freqs_cis, bias=bias)
+        x = self.transformer.ln_f(x)
+
+        logits = self.lm_head(x)
+        softmax_logits = F.softmax(logits, dim=-1)
+
+        return logits, softmax_logits
+
     def forward(model, *args, mode='pretrain', **kwargs):
         if mode == 'pretrain':
             return model.forward_pretrain(*args, **kwargs)
+        elif mode == 'logits':
+            return model.forward_logits(*args, **kwargs)
         elif mode == 'grpo':
             return model.forward_grpo(*args, **kwargs)
         elif mode == 'offline_grpo':
             return model.forward_offline_grpo(*args, **kwargs)
         else:
             raise ValueError(f"Unknown mode: {mode}")
-
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
